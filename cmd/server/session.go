@@ -205,12 +205,119 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 func (s *Session) createCall(callID string, record bool) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
 	s.wireCall(cm, callID)
-	ac := &activeCall{cm: cm}
+	// [P3] canais criados ANTES do reg.add (happens-before via r.mu): fecha a janela em que
+	// um teardown veria stopPlayout/playoutDone nil.
+	ac := &activeCall{cm: cm, stopPlayout: make(chan struct{}), playoutDone: make(chan struct{})}
 	if record {
 		ac.recorder = newCallRecorder(callID, s.log, time.Now())
 	}
 	s.reg.add(callID, ac)
+	s.startBrowserPlayout(callID, ac) // [pacing BR 12/08] loop de 20ms p/ o browser
 	return cm
+}
+
+// [pacing BR 12/08] Parâmetros do playout paceado (leg WhatsApp->navegador), em amostras
+// de PCM 48kHz mono. 20ms/frame (o que o WebRTC/NetEQ espera); 40ms de cushion antes de
+// emitir (absorve jitter sem inflar); teto de 200ms (bounda a latência sob drift/overrun).
+const (
+	playoutFrame48 = 960      // 20ms @ 48kHz
+	playoutPrime48 = 960 * 2  // 40ms de cushion
+	playoutMax48   = 960 * 10 // 200ms teto
+)
+
+// startBrowserPlayout dispara o loop que drena ac.playout a 20ms REGULARES e escreve Opus
+// 20ms no navegador. É a correção do delay: absorve no MOTOR o jitter que a Meta entrega,
+// em vez de repassá-lo ao Chrome (que inflava o buffer p/ ~1s). Silêncio no underrun mantém
+// a cadência (e re-prime o cushion). O loop lê bridge/codec por reg.mediaOf a cada tick
+// (enxerga swap de ponte). PARA no removeCall/drain ANTES de o codec cgo ser fechado.
+func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
+	stop := ac.stopPlayout // canais criados no literal do activeCall (createCall), antes do reg.add
+	done := ac.playoutDone
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		silence := make([]float32, playoutFrame48)
+		// [drift 12/08] instrumentação: a cada 5s loga a TAXA de saída (frames*960/tempo) e a
+		// de entrada (inSamples/tempo) contra o tempo REAL de parede. Se saída≈48000/s (tempo
+		// real) o motor está correto e o drift do navegador é do lado do cliente. Se >48000/s,
+		// o ticker/relogio do motor corre rápido. Um só ciclo de ligação já decide.
+		var outFrames int64
+		logStart := time.Now()
+		var lastIn, lastDrop int64
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+			outFrames++
+			if outFrames%250 == 0 { // ~5s
+				now := time.Now()
+				el := now.Sub(logStart).Seconds()
+				ac.playoutMu.Lock()
+				in, dr, buf := ac.inSamples, ac.dropped, len(ac.playout)
+				ac.playoutMu.Unlock()
+				if el > 0 {
+					outSmpS := float64(250*playoutFrame48) / el
+					inSmpS := float64(in-lastIn) / el
+					s.log.Info("[voz-drift]",
+						"out_smp_s", int(outSmpS), "out_x_realtime", outSmpS/48000,
+						"in_smp_s", int(inSmpS), "in_x_realtime", inSmpS/48000,
+						"buf_ms", buf/48, "drop_delta", dr-lastDrop, "call_id", callID)
+				}
+				logStart, lastIn, lastDrop = now, in, dr
+			}
+			// (1) DECIDE o frame de 20ms só com o buffer (playoutMu). O codec NÃO entra aqui.
+			ac.playoutMu.Lock()
+			if !ac.primed {
+				if len(ac.playout) >= playoutPrime48 {
+					ac.primed = true
+				} else {
+					ac.playoutMu.Unlock()
+					continue // acumulando o cushion inicial de 40ms (só no arranque)
+				}
+			}
+			frame := silence
+			if len(ac.playout) >= playoutFrame48 {
+				frame = make([]float32, playoutFrame48)
+				copy(frame, ac.playout[:playoutFrame48])
+				ac.playout = ac.playout[playoutFrame48:]
+			}
+			// [P2] Underrun: emite SILÊNCIO e MANTÉM primed (não re-prima). Assim a cadência
+			// RTP de 20ms nunca para — evita o gap que faria o NetEQ do Chrome re-inflar o
+			// buffer. Retoma áudio real assim que houver 20ms de novo (low-water = 1 frame).
+			ac.playoutMu.Unlock()
+
+			// (2) SNAPSHOT + Encode + WriteOpus sob mediaMu — ATÔMICO vs o Close de oldOC/oldB
+			// em setBridge. O tick roda inteiro ANTES do swap (codec antigo ainda válido) ou
+			// inteiro DEPOIS (mediaOf devolve o novo). [P1] evita opus_encoder_destroy correndo
+			// contra o Encode → segfault. Encode é cgo sub-ms; o Close espera no máx. 1 tick.
+			ac.mediaMu.Lock()
+			b, oc, ok := s.reg.mediaOf(callID)
+			if ok && b != nil && oc != nil {
+				if opus, err := oc.Encode(frame); err == nil && len(opus) > 0 {
+					_ = b.WriteOpus(opus, 20*time.Millisecond)
+				}
+			}
+			ac.mediaMu.Unlock()
+			if !ok {
+				return // chamada encerrada
+			}
+		}
+	}()
+}
+
+// stopBrowserPlayout encerra o loop e ESPERA ele sair antes que o chamador feche o codec
+// cgo (browserOpus). Sem essa barreira, o Encode do loop poderia rodar sobre um codec já
+// liberado (use-after-free no cgo). Idempotente.
+func stopBrowserPlayout(ac *activeCall) {
+	if ac.stopPlayout == nil {
+		return
+	}
+	close(ac.stopPlayout)
+	<-ac.playoutDone
+	ac.stopPlayout = nil
 }
 
 func (s *Session) wireCall(cm *call.CallManager, callID string) {
@@ -261,12 +368,20 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
+		// [pacing BR 12/08] NÃO encoda+envia aqui. Antes, isto rodava na cadência de
+		// CHEGADA da Meta (com o jitter dela) e em frames de 60ms → o NetEQ do Chrome
+		// inflava o jitter buffer p/ ~1s. Agora empilha o PCM 48k; o loop startBrowserPlayout
+		// drena a 20ms REGULARES, absorvendo o jitter no motor. Teto anti-drift/overrun
+		// (playoutMax48) bounda a latência se o relógio da Meta correr mais rápido.
 		pcm48 := media.Upsample16to48(pcm16)
-		opus, err := ac.browserOpus.Encode(pcm48)
-		if err != nil || len(opus) == 0 {
-			return
+		ac.playoutMu.Lock()
+		ac.inSamples += int64(len(pcm48)) // [drift] amostras de ENTRADA (p/ medir a taxa da Meta)
+		ac.playout = append(ac.playout, pcm48...)
+		if len(ac.playout) > playoutMax48 {
+			ac.dropped += int64(len(ac.playout) - playoutMax48) // [drift] descarte no teto
+			ac.playout = ac.playout[len(ac.playout)-playoutMax48:]
 		}
-		_ = ac.bridge.WriteOpus(opus, 60*time.Millisecond)
+		ac.playoutMu.Unlock()
 	}
 	cm.OnPeerVideo = func(au []byte) {
 		ac, ok := s.reg.get(callID)
@@ -581,6 +696,20 @@ func (s *Session) info() SessionInfo {
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		b.Close()
+		if oc != nil {
+			oc.Close()
+		}
+		return
+	}
+	// [P1 12/08] Segura o mediaMu em volta do swap E do Close de oldB/oldOC: o loop de playout
+	// usa o codec/ponte sob o MESMO mutex, então nunca há Encode/WriteOpus rodando enquanto
+	// opus_encoder_destroy/PeerConnection.Close executam (senão = use-after-free/segfault).
+	// oldB.DisableTerminate() antes do Close impede que fechar a ponte antiga encerre a chamada.
+	ac.mediaMu.Lock()
+	defer ac.mediaMu.Unlock()
 	oldB, oldOC, found := s.reg.setBridge(callID, b, oc)
 	if !found {
 		b.Close()
@@ -590,8 +719,6 @@ func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
 		return
 	}
 	if oldB != nil {
-		// A ponte nova assume o mesmo leg: fechar a antiga NÃO pode encerrar a chamada
-		// (senão o swap de renegociação/transferência derruba tudo via OnTerminalICE).
 		oldB.DisableTerminate()
 		oldB.Close()
 	}
@@ -605,6 +732,7 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	stopBrowserPlayout(ac) // [pacing BR 12/08] para o loop ANTES de fechar o codec cgo
 	s.finalizeRecording(ac)
 	if ac.bridge != nil {
 		ac.bridge.Close()
@@ -651,6 +779,7 @@ func (s *Session) terminateCall(callID string, reason core.EndCallReason) {
 func (s *Session) teardownAllCalls() {
 	for _, ac := range s.reg.drain() {
 		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+		stopBrowserPlayout(ac) // [pacing BR 12/08] para o loop ANTES de fechar o codec cgo
 		s.finalizeRecording(ac)
 		if ac.bridge != nil {
 			ac.bridge.Close()

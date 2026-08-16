@@ -17,7 +17,7 @@ func generateMOH() []float32 {
 	notes := []float64{440.00, 523.25, 659.25, 523.25, 440.00, 0, 493.88, 587.33, 493.88, 0}
 	const (
 		noteDur   = 0.34 // segundos por nota
-		amplitude = 0.16
+		amplitude = 0.08 // [12/08 Eduardo] reduzido de 0.16 — MOH estava alto no ouvido do cliente
 	)
 	samplesPerNote := int(noteDur * mohSampleRate)
 	attack := int(0.012 * mohSampleRate)
