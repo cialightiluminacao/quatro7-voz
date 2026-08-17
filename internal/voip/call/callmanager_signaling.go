@@ -110,6 +110,34 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	if call == nil {
 		return
 	}
+	// [frota 17/08 · chamadas-fantasma] Chamada RECEBIDA: um accept que CHEGA só pode ser de
+	// outro device da NOSSA conta (o cliente que ligou não manda accept). Se for um irmão
+	// (mesmo usuário, device diferente do nosso), a chamada foi atendida no APARELHO →
+	// encerra o NOSSO leg com accepted_elsewhere. Antes: o motor ia a "ativo" sem mídia e o
+	// terminate do cliente era ignorado → chamada eterna (caso Isadora, 4 fantasmas de horas).
+	if !call.IsInitiator() {
+		ownU := m.sock.OwnLID().User
+		if ownU == "" {
+			ownU = m.sock.OwnPN().User
+		}
+		ownFull1 := m.sock.OwnLID().String()
+		ownFull2 := m.sock.OwnPN().String()
+		pj := peerJid.String()
+		if peerJid.User == ownU && pj != ownFull1 && pj != ownFull2 {
+			m.mu.Lock()
+			_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: core.EndCallReasonAcceptedElsewhere})
+			ended := call
+			m.emitState()
+			m.mu.Unlock()
+			m.log.Info("incoming call accepted on another own device; ending motor leg",
+				"call_id", call.CallID, "accepted_on", pj)
+			if m.OnEnded != nil {
+				m.OnEnded(ended)
+			}
+			m.cleanupMedia()
+			return
+		}
+	}
 	info := signaling.ExtractNodeInfo(node)
 	if info == nil {
 		return
@@ -297,11 +325,25 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
 	// que não pode derrubar a chamada já ativa.
 	sender := wanode.AttrString(node.Attrs, "from")
+	// [frota 17/08] O "ignore" vale SÓ para devices que não atenderam DA MESMA PONTA que
+	// atendeu (irmãos do atendedor: reject tardio por timeout) ou irmãos da NOSSA conta.
+	// Terminate vindo do USUÁRIO REMOTO da chamada (o cliente desligou) SEMPRE processa —
+	// antes era descartado como "non-answering device" e a chamada virava fantasma eterna.
 	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
-		m.mu.Unlock()
-		m.log.Info("terminate from non-answering device ignored",
+		senderU := wanode.MustJID(sender).User
+		acceptedU := wanode.MustJID(m.acceptedByJid).User
+		ownU := m.sock.OwnLID().User
+		if ownU == "" {
+			ownU = m.sock.OwnPN().User
+		}
+		if senderU == acceptedU || senderU == ownU {
+			m.mu.Unlock()
+			m.log.Info("terminate from non-answering device ignored",
+				"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
+			return
+		}
+		m.log.Info("terminate from remote peer while accepted elsewhere; processing",
 			"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
-		return
 	}
 	info := signaling.ExtractNodeInfo(node)
 	reason := core.EndCallReasonUserEnded

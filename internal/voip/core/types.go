@@ -36,6 +36,9 @@ const (
 	EndCallReasonCancelled    EndCallReason = "cancelled"
 	EndCallReasonFailed       EndCallReason = "failed"
 	EndCallReasonDoNotDisturb EndCallReason = "do_not_disturb"
+	// [frota 17/08] Chamada RECEBIDA atendida em OUTRO aparelho da mesma conta: o leg
+	// do motor encerra na hora (antes ficava "ativo" fantasma para sempre).
+	EndCallReasonAcceptedElsewhere EndCallReason = "accepted_elsewhere"
 	EndCallReasonUnknown      EndCallReason = "unknown"
 )
 
