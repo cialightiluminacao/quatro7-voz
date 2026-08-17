@@ -31,6 +31,12 @@ func envStr(key, def string) string {
 	return def
 }
 
+// Preenchidos em build: -ldflags "-X main.buildVersion=... -X main.buildRevision=...".
+var (
+	buildVersion  = "dev"
+	buildRevision = "dev"
+)
+
 func main() {
 	addr := flag.String("addr", ":8080", "HTTP listen address")
 	// Storage: Postgres (1 banco por sessão, estilo WAHA). URL de manutenção em

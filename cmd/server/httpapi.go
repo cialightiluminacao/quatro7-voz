@@ -17,6 +17,7 @@ import (
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /api/version", s.handleVersion) // [frota 17/08] carimbo de build (fim da arqueologia de binário)
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionCreate)
@@ -268,6 +269,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// accountId (opcional) escopa os eventos de chamada por conta do Chatwoot: o
 	// widget do Chatwoot passa a conta dele; o painel admin não passa e recebe tudo.
 	s.broker.serveSSE(w, r, clientID(r), asInt(r.URL.Query().Get("accountId")))
+}
+
+// [frota 17/08] Versão/reviso do build — preenchidos por -ldflags no Dockerfile.
+func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"version": buildVersion, "revision": buildRevision})
 }
 
 func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {

@@ -54,7 +54,9 @@ COPY --from=opus /opt/libopus_mlow.so /src/native/libopus_mlow.so
 ENV CGO_ENABLED=1 \
     CC=gcc \
     CGO_LDFLAGS="-L/src/native -Wl,-rpath,/usr/local/lib"
-RUN go build -tags mlow -o /wacalls ./cmd/server
+ARG BUILD_VERSION=dev
+ARG BUILD_REVISION=dev
+RUN go build -tags mlow -ldflags "-X main.buildVersion=${BUILD_VERSION} -X main.buildRevision=${BUILD_REVISION}" -o /wacalls ./cmd/server
 
 # ---------- Stage 4: runtime enxuto ----------
 FROM debian:bookworm-slim AS runtime
@@ -69,3 +71,6 @@ WORKDIR /app
 EXPOSE 8080 50000
 ENTRYPOINT ["wacalls"]
 CMD ["-addr", ":8080", "-static", "/app/client/dist", "-db", "/data/wacalls.db"]
+ARG BUILD_VERSION=dev
+ARG BUILD_REVISION=dev
+LABEL org.opencontainers.image.version="${BUILD_VERSION}" org.opencontainers.image.revision="${BUILD_REVISION}"
