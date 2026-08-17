@@ -115,7 +115,7 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	// (mesmo usuário, device diferente do nosso), a chamada foi atendida no APARELHO →
 	// encerra o NOSSO leg com accepted_elsewhere. Antes: o motor ia a "ativo" sem mídia e o
 	// terminate do cliente era ignorado → chamada eterna (caso Isadora, 4 fantasmas de horas).
-	if !call.IsInitiator() {
+	if !call.IsInitiator() && !call.IsEnded() {
 		ownU := m.sock.OwnLID().User
 		if ownU == "" {
 			ownU = m.sock.OwnPN().User
@@ -125,6 +125,7 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 		pj := peerJid.String()
 		if peerJid.User == ownU && pj != ownFull1 && pj != ownFull2 {
 			m.mu.Lock()
+			m.acceptedByJid = pj // retransmissão do mesmo accept não re-encerra (IsEnded + guard acima)
 			_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: core.EndCallReasonAcceptedElsewhere})
 			ended := call
 			m.emitState()
