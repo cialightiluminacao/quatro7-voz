@@ -70,7 +70,8 @@ COPY --from=server /astracalls-passkey.zip /app/client/dist/astracalls-passkey.z
 WORKDIR /app
 EXPOSE 8080 50000
 ENTRYPOINT ["wacalls"]
-CMD ["-addr", ":8080", "-static", "/app/client/dist", "-db", "/data/wacalls.db"]
+# [frota 17/08] v0.0.6 removeu a flag -db (sqlite legado) — o CMD upstream quebrava o boot.
+CMD ["-addr", ":8080", "-static", "/app/client/dist"]
 ARG BUILD_VERSION=dev
 ARG BUILD_REVISION=dev
 LABEL org.opencontainers.image.version="${BUILD_VERSION}" org.opencontainers.image.revision="${BUILD_REVISION}"
