@@ -112,33 +112,48 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	}
 	// [frota 17/08 · chamadas-fantasma] Chamada RECEBIDA: um accept que CHEGA só pode ser de
 	// outro device da NOSSA conta (o cliente que ligou não manda accept). Se for um irmão
-	// (mesmo usuário, device diferente do nosso), a chamada foi atendida no APARELHO →
-	// encerra o NOSSO leg com accepted_elsewhere. Antes: o motor ia a "ativo" sem mídia e o
-	// terminate do cliente era ignorado → chamada eterna (caso Isadora, 4 fantasmas de horas).
-	if !call.IsInitiator() && !call.IsEnded() {
-		ownU := m.sock.OwnLID().User
-		if ownU == "" {
-			ownU = m.sock.OwnPN().User
-		}
-		ownFull1 := m.sock.OwnLID().String()
-		ownFull2 := m.sock.OwnPN().String()
-		pj := peerJid.String()
-		if peerJid.User == ownU && pj != ownFull1 && pj != ownFull2 {
-			m.mu.Lock()
-			m.acceptedByJid = pj // retransmissão do mesmo accept não re-encerra (IsEnded + guard acima)
-			_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: core.EndCallReasonAcceptedElsewhere})
-			ended := call
-			m.emitState()
+	// (mesmo usuário, device diferente do nosso — Store.LID/ID têm o NOSSO device; o celular é
+	// device 0 e chega sem sufixo), a chamada foi atendida no APARELHO → encerra o NOSSO leg
+	// com accepted_elsewhere. Antes: o motor ia a "ativo" sem mídia e o terminate do cliente
+	// era ignorado → chamada eterna (caso Isadora 17/08, 4 fantasmas de 81min no painel).
+	ownLid := m.sock.OwnLID()
+	ownPn := m.sock.OwnPN()
+	pj := peerJid.String()
+	ehIrmaoNosso := (peerJid.User == ownLid.User || peerJid.User == ownPn.User) &&
+		pj != ownLid.String() && pj != ownPn.String()
+	m.mu.Lock()
+	if call.IsEnded() {
+		// accept retransmitido de chamada já morta: NÃO segue ao caminho normal (re-setaria
+		// acceptedByJid, rekey SRTP e video.Setup pós-cleanup para um leg inexistente).
+		m.mu.Unlock()
+		return
+	}
+	if !call.IsInitiator() && ehIrmaoNosso {
+		if !call.CanAccept() {
+			// Dual-accept: o operador JÁ atendeu no softphone (Connecting/Active) e o accept
+			// do celular chegou atrasado (fan-out leva o RTT). First local accept wins — o
+			// accept do irmão NÃO prova que ele venceu; derrubar aqui mataria a chamada que
+			// o operador acabou de atender. Se o caller escolheu o celular, o terminate dele
+			// chega e É processado (guard do HandleCallTerminate) — nada fica fantasma.
 			m.mu.Unlock()
-			m.log.Info("incoming call accepted on another own device; ending motor leg",
-				"call_id", call.CallID, "accepted_on", pj)
-			if m.OnEnded != nil {
-				m.OnEnded(ended)
-			}
-			m.cleanupMedia()
+			m.log.Info("sibling accept ignored: our leg already accepted locally",
+				"call_id", call.CallID, "from", pj)
 			return
 		}
+		m.acceptedByJid = pj // retransmissão cai no guard first-accept-wins lá em cima
+		_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: core.EndCallReasonAcceptedElsewhere})
+		ended := call
+		m.emitState()
+		m.mu.Unlock()
+		m.log.Info("incoming call accepted on another own device; ending motor leg",
+			"call_id", call.CallID, "accepted_on", pj)
+		if m.OnEnded != nil {
+			m.OnEnded(ended)
+		}
+		m.cleanupMedia()
+		return
 	}
+	m.mu.Unlock()
 	info := signaling.ExtractNodeInfo(node)
 	if info == nil {
 		return
@@ -326,20 +341,30 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
 	// que não pode derrubar a chamada já ativa.
 	sender := wanode.AttrString(node.Attrs, "from")
-	// [frota 17/08] O "ignore" vale SÓ para devices que não atenderam DA MESMA PONTA que
-	// atendeu (irmãos do atendedor: reject tardio por timeout) ou irmãos da NOSSA conta.
-	// Terminate vindo do USUÁRIO REMOTO da chamada (o cliente desligou) SEMPRE processa —
-	// antes era descartado como "non-answering device" e a chamada virava fantasma eterna.
+	innerTag := ""
+	if inf := signaling.ExtractNodeInfo(node); inf != nil {
+		innerTag = inf.Tag
+	}
+	// [frota 17/08] REJECT só derruba chamada que ainda TOCA. Um reject com a chamada já
+	// atendida (aqui OU noutro device) é o timeout do irmão que continuou tocando — era o
+	// bug original do Eduardo: atender no softphone e o "dispensar" do celular DERRUBAVA a
+	// conversa em curso. Terminate é outra coisa (desligar de verdade) e segue abaixo.
+	if innerTag == "reject" && !call.IsRinging() && !call.IsEnded() {
+		m.mu.Unlock()
+		m.log.Info("late reject ignored: call no longer ringing",
+			"call_id", call.CallID, "from", sender, "state", string(call.StateData.State))
+		return
+	}
+	// [frota 17/08] O "ignore" pós-accept vale SÓ para irmãos: do atendedor (mesmo usuário
+	// que atendeu) ou NOSSOS (mesma conta, qualquer forma LID/PN). Terminate vindo do
+	// USUÁRIO REMOTO da chamada (o cliente desligou) SEMPRE processa — antes era descartado
+	// como "non-answering device" e a chamada virava fantasma eterna (caso Isadora).
 	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
 		senderU := wanode.MustJID(sender).User
 		acceptedU := wanode.MustJID(m.acceptedByJid).User
-		ownU := m.sock.OwnLID().User
-		if ownU == "" {
-			ownU = m.sock.OwnPN().User
-		}
-		if senderU == acceptedU || senderU == ownU {
+		if senderU == acceptedU || senderU == m.sock.OwnLID().User || senderU == m.sock.OwnPN().User {
 			m.mu.Unlock()
-			m.log.Info("terminate from non-answering device ignored",
+			m.log.Info("terminate from non-answering sibling ignored",
 				"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
 			return
 		}
