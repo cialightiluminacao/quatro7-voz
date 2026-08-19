@@ -1,8 +1,8 @@
 package main
 
 import (
-	"log"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -104,7 +104,8 @@ func (b *Broker) broadcast(ev any) {
 		select {
 		case s.ch <- data:
 		default:
-			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)
+		}
 	}
 }
 
@@ -131,7 +132,8 @@ func (b *Broker) broadcastForSession(sessionID string, ev any) {
 		select {
 		case s.ch <- data:
 		default:
-			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)
+		}
 	}
 }
 
@@ -163,7 +165,8 @@ func (b *Broker) broadcastForSessionTargeted(sessionID, targetClientID string, e
 		select {
 		case s.ch <- data:
 		default:
-			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)
+		}
 	}
 }
 
