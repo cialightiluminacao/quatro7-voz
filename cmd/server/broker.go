@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -75,7 +76,10 @@ func NewBroker() *Broker {
 }
 
 func (b *Broker) subscribe(clientID string, accountID int) *subscriber {
-	s := &subscriber{clientID: clientID, accountID: accountID, ch: make(chan []byte, 32)}
+	// [18/08 · beep infinito no painel] buffer 32 dava janela real de DROP silencioso de
+	// call-ended num assinante lento (evento de PARAR toque é o pior a perder). 256 =
+	// ~folga p/ rajada de sinalização inteira; drop residual agora é LOGADO por assinante.
+	s := &subscriber{clientID: clientID, accountID: accountID, ch: make(chan []byte, 256)}
 	b.mu.Lock()
 	b.subs[s] = struct{}{}
 	b.mu.Unlock()
@@ -100,7 +104,7 @@ func (b *Broker) broadcast(ev any) {
 		select {
 		case s.ch <- data:
 		default:
-		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
 	}
 }
 
@@ -127,7 +131,7 @@ func (b *Broker) broadcastForSession(sessionID string, ev any) {
 		select {
 		case s.ch <- data:
 		default:
-		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
 	}
 }
 
@@ -159,7 +163,7 @@ func (b *Broker) broadcastForSessionTargeted(sessionID, targetClientID string, e
 		select {
 		case s.ch <- data:
 		default:
-		}
+			log.Printf("[broker] evento DROPADO p/ assinante lento client=%s (fila cheia)", s.clientID)		}
 	}
 }
 
