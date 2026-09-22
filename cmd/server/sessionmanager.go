@@ -120,7 +120,33 @@ func (m *SessionManager) infos() []SessionInfo {
 }
 
 func (m *SessionManager) snapshotEvents() []any {
-	return []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
+	return append([]any{map[string]any{"type": "session-list", "sessions": m.infos()}}, m.qrSnapshots()...)
+}
+
+// qrSnapshots devolve um auth-state por sessão com QR em exibição.
+func (m *SessionManager) qrSnapshots() []any {
+	var evs []any
+	// QR em exibição vai junto no snapshot: quem abre o stream no meio do pareamento
+	// vê o QR atual. Sem isso o painel pedia um /pair novo só para ter imagem, e
+	// cada /pair troca o QR (e o aparelho) que o operador talvez já esteja lendo.
+	m.mu.RLock()
+	all := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		all = append(all, s)
+	}
+	m.mu.RUnlock()
+	for _, s := range all {
+		s.mu.Lock()
+		a := s.auth
+		s.mu.Unlock()
+		if a.State == "qr" && a.QR != "" {
+			evs = append(evs, map[string]any{
+				"type": "auth-state", "sessionId": s.id,
+				"paired": a.Paired, "state": a.State, "qr": a.QR,
+			})
+		}
+	}
+	return evs
 }
 
 func (m *SessionManager) Restore(ctx context.Context) error {
