@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -615,6 +616,14 @@ func (s *Session) connect(ctx context.Context) error {
 }
 
 func (s *Session) startPairing(ctx context.Context) error {
+	return s.pairLoop(ctx, true, nil)
+}
+
+// pairLoop conecta um device novo e trata os eventos do canal de pareamento.
+// showQR=false é o pareamento por código: o QR que o servidor gera continua
+// chegando, mas não é publicado. ready (se não nil) é fechado no primeiro evento,
+// que é quando o whatsmeow diz que a conexão está pronta para pedir o código.
+func (s *Session) pairLoop(ctx context.Context, showQR bool, ready chan<- struct{}) error {
 	s.applyProxy()
 	qrChan, err := s.client.GetQRChannel(ctx)
 	if err != nil {
@@ -625,8 +634,15 @@ func (s *Session) startPairing(ctx context.Context) error {
 	}
 	go func() {
 		for evt := range qrChan {
+			if ready != nil {
+				close(ready)
+				ready = nil
+			}
 			switch evt.Event {
 			case "code":
+				if !showQR {
+					continue
+				}
 				s.log.Info("scan the QR code to pair this session")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				s.setAuth(AuthSnapshot{State: "qr", QR: evt.Code})
@@ -678,11 +694,20 @@ func (s *Session) setPasskeyChallenge(pk *types.WebAuthnPublicKey) {
 // por telefone (o usuário digita o código no WhatsApp: Aparelhos conectados ->
 // Conectar com número). O sucesso chega depois via events.Connected.
 func (s *Session) startPhonePairing(ctx context.Context, phone string) (string, error) {
-	s.applyProxy()
-	if err := s.client.Connect(); err != nil {
+	// O whatsmeow exige conexão pronta (primeiro evento do canal) antes do
+	// PairPhone; pedir logo após o Connect dava 400 bad-request.
+	ready := make(chan struct{})
+	if err := s.pairLoop(ctx, false, ready); err != nil {
 		return "", err
 	}
-	code, err := s.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "AstraCalls")
+	select {
+	case <-ready:
+	case <-time.After(15 * time.Second):
+		return "", errors.New("conexão com o WhatsApp não ficou pronta para gerar o código")
+	}
+	// O nome precisa ser "Navegador (SO)" com valores conhecidos; "AstraCalls"
+	// sempre voltava 400 bad-request.
+	code, err := s.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		return "", err
 	}
