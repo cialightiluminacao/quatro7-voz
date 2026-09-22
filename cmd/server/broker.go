@@ -44,6 +44,7 @@ type SessionInfo struct {
 	JID       string `json:"jid"`
 	State     string `json:"state"`
 	Paired    bool   `json:"paired"`
+	Linked    bool   `json:"linked"` // o celular concluiu o vínculo (entregou a chave de app state)
 	Recording bool   `json:"recording"`
 }
 

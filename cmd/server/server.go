@@ -17,7 +17,8 @@ type server struct {
 // newServer monta o provedor de banco (Postgres, 1 banco por sessão no estilo
 // WAHA), abre o banco principal e inicializa o gerenciador de sessões.
 func newServer(ctx context.Context, pgURL, pgNamespace, staticDir string, maxCalls int, log *slog.Logger) (*server, error) {
-	waLogger := waLog.Noop
+	// WARN sempre: com Noop, falha de pareamento e de decriptação sumiam do log.
+	waLogger := waLog.Stdout("WA", "WARN", false)
 	if log.Enabled(ctx, slog.LevelDebug) {
 		waLogger = waLog.Stdout("WA", "DEBUG", true)
 	}

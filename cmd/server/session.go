@@ -50,6 +50,14 @@ type Session struct {
 	// enquanto ela segue caída; volta a false ao reconectar (events.Connected).
 	downAlerted bool
 
+	// linked diz se o CELULAR concluiu o vínculo deste aparelho. O pareamento pelo
+	// QR fecha do lado do servidor (pair-success) antes do celular terminar: ele
+	// ainda precisa entregar a chave de app state. Se o celular falha nessa etapa
+	// (o "carrega e dá erro" no WhatsApp), o motor ficava "open" em cima de um
+	// vínculo pela metade e o painel mostrava conectado. Só vira true depois que
+	// a chave chega; volta a false ao trocar o client (novo pareamento).
+	linked bool
+
 	// sentIDs guarda os IDs de mensagens que ESTE cliente enviou, com a origem
 	// (API ou agente do Chatwoot), para decidir o que fazer quando voltarem como
 	// evento from_me. msgID -> selfSent.
@@ -489,11 +497,37 @@ func (s *Session) handleEvent(rawEvt any) {
 		if s.getChatwoot().AlwaysOnline {
 			go func() { _ = s.client.SendPresence(ctx, types.PresenceAvailable) }()
 		}
+	case *events.Disconnected:
+		// socket caiu; o whatsmeow reconecta sozinho e o Connected devolve "open".
+		// Antes o estado seguia "open" e o painel mostrava conectado sem conexão.
+		if s.client.Store.ID != nil {
+			s.log.Warn("socket do WhatsApp caiu; reconectando")
+			s.setAuth(AuthSnapshot{State: "connecting", Paired: true})
+		}
+	case *events.KeepAliveTimeout:
+		s.log.Warn("WhatsApp sem resposta ao keepalive", "falhas", evt.ErrorCount)
+		if evt.ErrorCount >= 2 && s.client.Store.ID != nil {
+			s.setAuth(AuthSnapshot{State: "connecting", Paired: true})
+		}
+	case *events.KeepAliveRestored:
+		if s.client.IsConnected() && s.client.Store.ID != nil {
+			s.setAuth(AuthSnapshot{State: "open", Paired: true})
+		}
+	case *events.PairSuccess:
+		s.log.Info("pair-success recebido", "jid", evt.ID.String(), "plataforma", evt.Platform)
+	case *events.PairError:
+		s.log.Warn("pareamento falhou", "jid", evt.ID.String(), "err", evt.Error)
+	case *events.ConnectFailure:
+		s.log.Warn("WhatsApp recusou a conexão", "reason", evt.Reason.String(), "msg", evt.Message)
 	case *events.LoggedOut:
+		s.log.Warn("aparelho desvinculado pelo celular", "reason", evt.Reason.String())
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 		go s.notifyDisconnected("desconectada (o aparelho desvinculou este dispositivo)",
 			"Reconecte lendo o QR no painel do AstraCalls para voltar a enviar e receber.")
 	case *events.StreamReplaced:
+		// o whatsmeow NÃO reconecta depois de stream replaced: o socket fica fechado.
+		s.log.Warn("conexão substituída por outra do mesmo aparelho")
+		s.setAuth(AuthSnapshot{State: "replaced", Paired: true})
 		go s.notifyDisconnected("substituída por outra conexão do mesmo número",
 			"Se não foi proposital, reconecte pelo painel do AstraCalls.")
 	case *events.TemporaryBan:
@@ -601,8 +635,11 @@ func (s *Session) startPairing(ctx context.Context) error {
 				if id := s.client.Store.ID; id != nil {
 					_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 				}
+				s.log.Info("QR lido: pareado no servidor, aguardando o celular concluir o vínculo", "jid", jidOf(s.client))
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
+				go s.watchLink(s.client)
 			case "timeout":
+				s.log.Warn("pareamento: QR expirou sem leitura")
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 			case "passkey-request":
 				// conta com passkey: o WhatsApp exige uma prova WebAuthn do dono.
@@ -692,7 +729,73 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", Recording: rec}
+	state := a.State
+	linked := jid != "" && s.linkDone()
+	if state == "open" && !linked {
+		// pareada no servidor, mas o celular ainda não concluiu o vínculo.
+		state = "linking"
+	}
+	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: state, Paired: a.Paired || jid != "", Linked: linked, Recording: rec}
+}
+
+// linkDone informa se o celular já entregou a chave de app state (vínculo
+// concluído). Consulta o store só enquanto ainda não viu a chave; depois fica
+// em memória até o próximo pareamento.
+func (s *Session) linkDone() bool {
+	s.mu.Lock()
+	done := s.linked
+	s.mu.Unlock()
+	if done {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(s.mgr.appCtx, 2*time.Second)
+	defer cancel()
+	id, err := s.client.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil || id == nil {
+		return false
+	}
+	s.mu.Lock()
+	s.linked = true
+	s.mu.Unlock()
+	return true
+}
+
+// watchLink acompanha o fim do vínculo depois do pair-success: avisa a lista de
+// sessões assim que o celular entrega a chave (o painel sai de "linking" sem
+// esperar outro evento) e registra quando o celular não conclui a tempo.
+func (s *Session) watchLink(client *whatsmeow.Client) {
+	const limite = 5 * time.Minute
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	fim := time.After(limite)
+	for {
+		select {
+		case <-s.mgr.appCtx.Done():
+			return
+		case <-fim:
+			if s.client == client && !s.linkDone() {
+				s.log.Warn("vínculo incompleto: o celular não concluiu em 5 min; desvincule este aparelho no celular e pareie de novo",
+					"jid", jidOf(client))
+			}
+			return
+		case <-tick.C:
+			if s.client != client {
+				return // outro pareamento começou
+			}
+			if s.linkDone() {
+				s.log.Info("vínculo concluído pelo celular", "jid", jidOf(client))
+				s.mgr.broker.emitSessionList(s.mgr.infos())
+				return
+			}
+		}
+	}
+}
+
+func jidOf(c *whatsmeow.Client) string {
+	if id := c.Store.ID; id != nil {
+		return id.String()
+	}
+	return ""
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
@@ -822,6 +925,9 @@ func (s *Session) replaceClient(client *whatsmeow.Client) {
 	s.teardownAllCalls()
 	s.client.Disconnect()
 	s.client = client
+	s.mu.Lock()
+	s.linked = false
+	s.mu.Unlock()
 	client.AddEventHandler(s.handleEvent)
 }
 
