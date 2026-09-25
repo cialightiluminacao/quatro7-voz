@@ -2,6 +2,7 @@ package call
 
 import (
 	"context"
+	"strings"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/signaling"
@@ -337,13 +338,33 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 		m.mu.Unlock()
 		return
 	}
-	// Depois de um accept, só o device que atendeu pode encerrar. Um sibling que
-	// continuou tocando eventualmente dá timeout e manda o próprio reject/terminate,
-	// que não pode derrubar a chamada já ativa.
 	sender := wanode.AttrString(node.Attrs, "from")
+	info := signaling.ExtractNodeInfo(node)
+	reason := core.EndCallReasonUserEnded
+	if info != nil {
+		if r := wanode.AttrString(info.InnerNode.Attrs, "reason"); r != "" {
+			reason = core.EndCallReason(r)
+		}
+	}
+
+	// [upstream c6073d6] Um device secundário hosted.lid vinculado à nossa própria conta
+	// pode responder ao offer de entrada com "uncallable" antes de o operador atender. O
+	// evento tipado CallReject do whatsmeow não preserva o atributo externo platform=capi,
+	// então usamos a identidade hosted.lid que permanece disponível. Esse reject descreve
+	// somente a incapacidade do sibling; o chamador original segue tocando.
+	if call.Direction == core.CallDirectionIncoming && call.CanAccept() &&
+		reason == core.EndCallReasonUncallable && info != nil &&
+		strings.HasSuffix(strings.ToLower(sender), "@hosted.lid") &&
+		sender != call.CallCreator && sender != call.PeerJid {
+		m.mu.Unlock()
+		m.log.Info("uncallable from secondary hosted device ignored",
+			"call_id", call.CallID, "from", sender, "call_creator", call.CallCreator)
+		return
+	}
+
 	innerTag := ""
-	if inf := signaling.ExtractNodeInfo(node); inf != nil {
-		innerTag = inf.Tag
+	if info != nil {
+		innerTag = info.Tag
 	}
 	// [frota 17/08] REJECT só derruba chamada que ainda TOCA. Um reject com a chamada já
 	// atendida (aqui OU noutro device) é o timeout do irmão que continuou tocando — era o
@@ -359,6 +380,7 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 	// que atendeu) ou NOSSOS (mesma conta, qualquer forma LID/PN). Terminate vindo do
 	// USUÁRIO REMOTO da chamada (o cliente desligou) SEMPRE processa — antes era descartado
 	// como "non-answering device" e a chamada virava fantasma eterna (caso Isadora).
+	// (Substitui o guard simples do upstream, que descartava também o terminate do remoto.)
 	if m.acceptedByJid != "" && sender != "" && sender != m.acceptedByJid && !call.IsEnded() {
 		senderU := wanode.MustJID(sender).User
 		acceptedU := wanode.MustJID(m.acceptedByJid).User
@@ -370,13 +392,6 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 		}
 		m.log.Info("terminate from remote peer while accepted elsewhere; processing",
 			"call_id", call.CallID, "from", sender, "accepted_by", m.acceptedByJid)
-	}
-	info := signaling.ExtractNodeInfo(node)
-	reason := core.EndCallReasonUserEnded
-	if info != nil {
-		if r := wanode.AttrString(info.InnerNode.Attrs, "reason"); r != "" {
-			reason = core.EndCallReason(r)
-		}
 	}
 	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason))
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})

@@ -35,6 +35,7 @@ const (
 	EndCallReasonBusy         EndCallReason = "busy"
 	EndCallReasonCancelled    EndCallReason = "cancelled"
 	EndCallReasonFailed       EndCallReason = "failed"
+	EndCallReasonUncallable   EndCallReason = "uncallable"
 	EndCallReasonDoNotDisturb EndCallReason = "do_not_disturb"
 	// [frota 17/08] Chamada RECEBIDA atendida em OUTRO aparelho da mesma conta: o leg
 	// do motor encerra na hora (antes ficava "ativo" fantasma para sempre).
