@@ -153,6 +153,13 @@ func (m *CallManager) RequestVideoUpgrade(ctx context.Context) error {
 // AcceptVideoUpgrade aceita um pedido de upgrade recebido: responde state=4 e, em
 // seguida, state=1 (câmera ligada).
 func (m *CallManager) AcceptVideoUpgrade(ctx context.Context) error {
+	return m.AcceptVideoUpgradeWith(ctx, true)
+}
+
+// AcceptVideoUpgradeWith aceita o upgrade; withCamera=false só recebe o vídeo do
+// peer (state=4) e NÃO anuncia câmera nossa (sem state=1) — para o atendente que
+// não tem câmera. Depois, RequestVideoUpgrade liga a câmera com state=1.
+func (m *CallManager) AcceptVideoUpgradeWith(ctx context.Context, withCamera bool) error {
 	m.mu.Lock()
 	call := m.currentCall
 	if call == nil || !call.IsActive() {
@@ -160,7 +167,7 @@ func (m *CallManager) AcceptVideoUpgrade(ctx context.Context) error {
 		return &CallError{"no active call to upgrade"}
 	}
 	call.StateData.VideoUpgradeIncoming = false
-	call.StateData.VideoOff = false
+	call.StateData.VideoOff = !withCamera
 	call.MediaType = core.CallMediaTypeVideo
 	peer := m.videoPeerLocked()
 	creator := wanode.MustJID(call.CallCreator)
@@ -172,7 +179,7 @@ func (m *CallManager) AcceptVideoUpgrade(ctx context.Context) error {
 		CallID: callID, To: peer, CallCreator: creator,
 		State: signaling.VideoStateUpgradeAccept, Dec: signaling.VideoDecAccept,
 	})
-	if err := m.sock.SendNode(ctx, accept); err != nil {
+	if err := m.sock.SendNode(ctx, accept); err != nil || !withCamera {
 		return err
 	}
 	orientation := 0

@@ -410,7 +410,7 @@ func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
 	case "request":
 		err = ac.cm.RequestVideoUpgrade(r.Context())
 	case "accept":
-		err = ac.cm.AcceptVideoUpgrade(r.Context())
+		err = ac.cm.AcceptVideoUpgradeWith(r.Context(), videoAcceptComCamera(r))
 	case "reject":
 		err = ac.cm.RejectVideoUpgrade(r.Context())
 	case "stop":
@@ -424,6 +424,18 @@ func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// videoAcceptComCamera lê o corpo opcional {"withCamera": false} de video/accept.
+// Sem corpo (ou inválido) = true, o comportamento antigo (aceita e liga a câmera).
+func videoAcceptComCamera(r *http.Request) bool {
+	var b struct {
+		WithCamera *bool `json:"withCamera"`
+	}
+	if r.Body == nil || json.NewDecoder(r.Body).Decode(&b) != nil || b.WithCamera == nil {
+		return true
+	}
+	return *b.WithCamera
 }
 
 // handleHold coloca uma chamada ativa em espera. Body opcional {"moh": true} liga a
