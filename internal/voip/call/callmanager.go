@@ -242,7 +242,13 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 		return &CallError{"no call with id " + callID}
 	}
 	_ = call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason})
-	node := signaling.BuildRejectStanza(wanode.MustJID(call.PeerJid), call.CallID, wanode.MustJID(call.CallCreator))
+	peer := wanode.MustJID(call.PeerJid)
+	// from=ownID no perfil do peer: LID p/ peer @lid, PN p/ peer @s.whatsapp.net.
+	own := m.sock.OwnLID()
+	if peer.Server == types.DefaultUserServer {
+		own = m.sock.OwnPN()
+	}
+	node := signaling.BuildRejectStanza(peer, call.CallID, wanode.MustJID(call.CallCreator), own)
 	m.emitState()
 	m.mu.Unlock()
 
