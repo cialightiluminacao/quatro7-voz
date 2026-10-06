@@ -139,3 +139,46 @@ func TestTerminateDoCallerEnquantoToca(t *testing.T) {
 		t.Fatal("terminate do caller devia encerrar a chamada tocando")
 	}
 }
+
+// [frota6] Ordem dos guards em HandleCallTerminate após o merge com o upstream: o
+// uncallable de um irmão @hosted.lid (upstream c6073d6) é ignorado com a chamada
+// tocando, e um reject comum do celular (nosso guard) continua derrubando.
+func TestHostedLIDUncallableIgnoradoMasRejectDoCelularDerruba(t *testing.T) {
+	m := incomingManager(&fakeSock{})
+	hosted := &waBinary.Node{
+		Tag:   "call",
+		Attrs: waBinary.Attrs{"from": "999:99@hosted.lid"},
+		Content: []waBinary.Node{{
+			Tag:   "reject",
+			Attrs: waBinary.Attrs{"call-id": "CALL1", "call-creator": "271592307339424@lid", "reason": "uncallable"},
+		}},
+	}
+	m.HandleCallTerminate(hosted)
+	if m.currentCall.IsEnded() {
+		t.Fatal("uncallable do irmão hosted.lid não pode derrubar a chamada tocando")
+	}
+	celular := types.NewJID("999", types.HiddenUserServer)
+	celular.Device = 5
+	m.HandleCallTerminate(rejectNode("CALL1", celular))
+	if !m.currentCall.IsEnded() {
+		t.Fatal("reject do celular com a chamada tocando devia encerrar")
+	}
+}
+
+// [frota6] Terminate que chega como UnknownCallEvent (vários filhos, o terminal não é
+// o primeiro — upstream 2998176) vindo do CLIENTE com a chamada tocando encerra.
+func TestTerminateMultiNoDoClienteEncerra(t *testing.T) {
+	m := incomingManager(&fakeSock{})
+	n := &waBinary.Node{
+		Tag:   "call",
+		Attrs: waBinary.Attrs{"from": "271592307339424@lid"},
+		Content: []waBinary.Node{
+			{Tag: "relaylatency", Attrs: waBinary.Attrs{"call-id": "CALL1"}},
+			{Tag: "terminate", Attrs: waBinary.Attrs{"call-id": "CALL1", "call-creator": "271592307339424@lid"}},
+		},
+	}
+	m.HandleCallTerminate(n)
+	if !m.currentCall.IsEnded() {
+		t.Fatal("terminate multi-nó do cliente devia encerrar a chamada tocando")
+	}
+}
