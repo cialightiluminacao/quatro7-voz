@@ -171,9 +171,14 @@ func (m *CallManager) handleAudioRelayData(data []byte) {
 		return
 	}
 	if m.OnPeerAudio != nil {
-		m.OnPeerAudio(m.alignPeerAudio(pkt.Header.Timestamp, pcm))
+		if aligned := m.alignPeerAudio(pkt.Header.Timestamp, pcm); len(aligned) > 0 {
+			m.OnPeerAudio(aligned)
+		}
 	}
 }
+
+// PeerLateDrops conta os pacotes de áudio do peer descartados por atraso/duplicata.
+func (m *CallManager) PeerLateDrops() int64 { return m.peerLateDrops.Load() }
 
 func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
 	const maxGapSamples = 8000
@@ -188,6 +193,14 @@ func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
 	}
 	target := uint64(ts - m.audioBaseTs)
 	gap := int64(target) - int64(m.audioPlayedSamples)
+	if gap < 0 && -gap <= maxGapSamples {
+		// [frota6c] Atrasado (retransmissão do SCTP não ordenado) ou duplicado (2º relay):
+		// o slot dele já saiu (com o áudio ou com o padding de silêncio). Reiniciar a
+		// timeline aqui mandava áudio velho fora de ordem para o fim do buffer e fazia o
+		// pacote seguinte ganhar padding falso — +120ms de lixo por pacote atrasado.
+		m.peerLateDrops.Add(1)
+		return nil
+	}
 	if gap < 0 || gap > maxGapSamples {
 		m.audioBaseTs = ts
 		m.audioPlayedSamples = origLen

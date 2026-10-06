@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 	callvideo "wacalls/internal/voip/call/video"
 	"wacalls/internal/voip/core"
@@ -54,6 +55,9 @@ type CallManager struct {
 	audioTimelineSet   bool
 	audioBaseTs        uint32
 	audioPlayedSamples uint64
+	// [frota6c] pacotes de áudio do peer descartados por chegarem atrasados/duplicados
+	// (ver alignPeerAudio). Atômico: o loop de playout lê para o log [voz-drift].
+	peerLateDrops atomic.Int64
 
 	OnStateChange func(*CallInfo)
 	OnIncoming    func(*CallInfo)

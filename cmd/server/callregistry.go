@@ -22,15 +22,12 @@ type activeCall struct {
 	// de chegada da Meta (com o jitter dela), e o NetEQ do Chrome inflava o buffer p/
 	// ~1s de atraso. Guardado por playoutMu; parado (stopPlayout/playoutDone) ANTES de
 	// fechar browserOpus (o Encode é cgo — não pode rodar sobre o codec já liberado).
+	// [frota6c 06/10] Buffer ADAPTATIVO (playout_buffer.go); também guarda a instrumentação
+	// [drift] (entrada, underruns, descartes) que o loop loga a cada 5s.
 	playoutMu   sync.Mutex
-	playout     []float32
-	primed      bool
+	playout     playoutBuffer
 	stopPlayout chan struct{}
 	playoutDone chan struct{}
-	// [drift 12/08] instrumentação (sob playoutMu): amostras 48k empilhadas (entrada) e
-	// descartadas no teto. O loop loga a TAXA de saída vs entrada a cada 5s p/ achar o drift.
-	inSamples int64
-	dropped   int64
 	// [P1 12/08] Serializa o USO do codec/ponte no loop de playout (Encode/WriteOpus) com a
 	// TROCA+Close de bridge/browserOpus em setBridge. Sem isto, oldOC.Close()
 	// (opus_encoder_destroy) podia rodar durante o oc.Encode do loop → use-after-free no cgo
