@@ -348,7 +348,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			return
 		}
 		// [upstream 4301d8f] atendida: marca e cancela o timeout de toque (não expirar).
-		if c.IsActive() {
+		// [frota6] Vale para QUALQUER estado fora do toque (connecting/active/on_hold), não
+		// só "active": o upstream só marcava em active, e um atendimento aos ~59s ainda em
+		// connecting (ICE/relay subindo) seria recusado pelo timer aos 60s.
+		if !c.IsRinging() {
 			if ac, ok := s.reg.get(c.CallID); ok {
 				ac.answered.Store(true)
 				s.reg.stopRingTimer(c.CallID)
