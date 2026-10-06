@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 	callvideo "wacalls/internal/voip/call/video"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
@@ -11,6 +12,7 @@ import (
 	"wacalls/internal/voip/transport"
 	"wacalls/internal/voip/wanode"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -252,7 +254,7 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 	m.emitState()
 	m.mu.Unlock()
 
-	go func() { _, _ = m.sock.Query(ctx, node) }()
+	m.sendDetached(ctx, node, "reject não enviado", callID)
 	m.cleanupMedia()
 	return nil
 }
@@ -270,12 +272,26 @@ func (m *CallManager) EndCall(ctx context.Context, reason core.EndCallReason) er
 	m.emitState()
 	m.mu.Unlock()
 
-	go func() { _, _ = m.sock.Query(ctx, node) }()
+	m.sendDetached(ctx, node, "terminate não enviado", ended.CallID)
 	if m.OnEnded != nil {
 		m.OnEnded(ended)
 	}
 	m.cleanupMedia()
 	return nil
+}
+
+// sendDetached envia a stanza em background, desacoplada do ctx de quem chamou.
+// Pelo HTTP o ctx é r.Context(): o net/http o cancela assim que o handler
+// responde, e o whatsmeow (NoiseSocket.SendFrame) recusa ctx cancelado — o
+// <reject>/<terminate> nunca saía e o celular de quem ligou seguia tocando.
+func (m *CallManager) sendDetached(ctx context.Context, node waBinary.Node, msg, callID string) {
+	go func() {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		if _, err := m.sock.Query(sendCtx, node); err != nil {
+			m.log.Warn(msg, "call_id", callID, "err", err)
+		}
+	}()
 }
 
 func (m *CallManager) ownCredJid() string {
