@@ -119,9 +119,27 @@ func (c *mlowCodec) Encode(pcm []float32) ([]byte, error) {
 }
 
 func (c *mlowCodec) Decode(frame []byte) ([]float32, error) {
+	// Vídeo/DTX pode agrupar frames sequenciais no container 0x92. Cada frame
+	// deve avançar o decoder separadamente, na ordem do payload (upstream 1bafdb1).
+	if frames, ok := splitContainer(frame); ok {
+		var pcm []float32
+		for _, sub := range frames {
+			decoded, err := c.decodeBare(sub)
+			if err != nil {
+				return nil, err
+			}
+			pcm = append(pcm, decoded...)
+		}
+		return pcm, nil
+	}
+	return c.decodeBare(frame)
+}
+
+func (c *mlowCodec) decodeBare(frame []byte) ([]float32, error) {
 	out := make([]C.int16_t, mlowMaxOut)
 	var n C.int
-	if frame == nil {
+	if len(frame) == 0 {
+		// Frame vazio aciona PLC por design.
 		n = C.opus_decode(c.decoder, nil, 0, &out[0], C.int(mlowFrameSize), 0)
 	} else {
 		cdata := (*C.uchar)(unsafe.Pointer(&frame[0]))
@@ -152,6 +170,7 @@ func (c *mlowCodec) Close() {
 }
 
 type opusGeneric struct {
+	mu         sync.Mutex // Encode/Decode/Close; nunca adquire locks do chamador
 	encoder    unsafe.Pointer
 	decoder    unsafe.Pointer
 	sampleRate int
@@ -179,6 +198,11 @@ func NewOpusCodec(sampleRate, frameSize int) (Codec, error) {
 }
 
 func (c *opusGeneric) Encode(pcm []float32) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.encoder == nil {
+		return nil, fmt.Errorf("opus codec closed")
+	}
 	if len(pcm) == 0 {
 		return nil, nil
 	}
@@ -204,10 +228,15 @@ func (c *opusGeneric) Encode(pcm []float32) ([]byte, error) {
 }
 
 func (c *opusGeneric) Decode(frame []byte) ([]float32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.decoder == nil {
+		return nil, fmt.Errorf("opus codec closed")
+	}
 	maxOut := c.sampleRate / 1000 * 120
 	out := make([]C.int16_t, maxOut)
 	var n C.int
-	if frame == nil {
+	if len(frame) == 0 {
 		n = C.opus_decode(c.decoder, nil, 0, &out[0], C.int(c.frameSize), 0)
 	} else {
 		cdata := (*C.uchar)(unsafe.Pointer(&frame[0]))
@@ -227,6 +256,8 @@ func (c *opusGeneric) FrameSize() int  { return c.frameSize }
 func (c *opusGeneric) SampleRate() int { return c.sampleRate }
 
 func (c *opusGeneric) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.decoder != nil {
 		C.opus_decoder_destroy(c.decoder)
 		c.decoder = nil

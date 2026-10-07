@@ -25,8 +25,12 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 	if m.codec == nil || len(data) == 0 {
 		return
 	}
+	m.sendStatsMu.Lock()
+	defer m.sendStatsMu.Unlock()
+	m.sendStats.CaptureFrames++
 	m.captureBuf = append(m.captureBuf, data...)
 	if maxBuffered := m.codec.FrameSize() * 4; len(m.captureBuf) > maxBuffered {
+		m.sendStats.CaptureDroppedSamples += int64(len(m.captureBuf) - maxBuffered)
 		m.captureBuf = m.captureBuf[len(m.captureBuf)-maxBuffered:]
 	}
 }
@@ -46,9 +50,11 @@ func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 
 	srtp, err := m.srtpSession.Protect(pkt)
 	if err != nil {
+		m.noteSendError()
 		m.log.Debug("srtp protect error", "err", err)
 		return
 	}
+	m.noteSendLocked(time.Now())
 	m.relay.Broadcast(srtp)
 }
 
@@ -70,29 +76,50 @@ func (m *CallManager) startMediaSendLoopLocked() {
 			case <-ticker.C:
 			}
 			m.mu.Lock()
-			if m.codec == nil || m.rtpSession == nil || m.srtpSession == nil || !m.relay.HasConnection() {
+			if m.sendLoopStop != stop {
 				m.mu.Unlock()
-				continue
+				return
 			}
-			frame := silence
-			switch {
-			case m.held:
-				// Em espera: não envia o mic do atendente. Toca música de espera
-				// (ou silêncio) para o interlocutor manter o leg vivo.
-				if m.mohEnabled {
-					frame = m.nextMohFrameLocked(frameSize)
-				}
-			case len(m.captureBuf) >= frameSize:
-				frame = make([]float32, frameSize)
-				copy(frame, m.captureBuf[:frameSize])
-				m.captureBuf = m.captureBuf[frameSize:]
-			}
-			if opus, err := m.codec.Encode(frame); err == nil {
-				m.sendOpusFrameLocked(opus)
-			}
+			m.sendMediaFrameLocked(silence)
 			m.mu.Unlock()
 		}
 	}()
+}
+
+// sendMediaFrameLocked mantém a seleção/agregação histórica (mu travado).
+func (m *CallManager) sendMediaFrameLocked(silence []float32) {
+	frameSize := len(silence)
+	if m.codec == nil || m.rtpSession == nil || m.srtpSession == nil || !m.relay.HasConnection() {
+		return
+	}
+	frame := silence
+	switch {
+	case m.held:
+		// Em espera: não envia o mic do atendente. Toca música de espera
+		// (ou silêncio) para o interlocutor manter o leg vivo.
+		if m.mohEnabled {
+			frame = m.nextMohFrameLocked(frameSize)
+		}
+	case len(m.captureBuf) >= frameSize:
+		frame = make([]float32, frameSize)
+		copy(frame, m.captureBuf[:frameSize])
+		m.captureBuf = m.captureBuf[frameSize:]
+	default:
+		m.sendStatsMu.Lock()
+		m.sendStats.CaptureUnderruns++
+		m.sendStatsMu.Unlock()
+	}
+	started := time.Now()
+	opus, err := m.codec.Encode(frame)
+	encodeDuration := time.Since(started)
+	m.sendStatsMu.Lock()
+	m.sendStats.EncodeMax = max(m.sendStats.EncodeMax, encodeDuration)
+	m.sendStatsMu.Unlock()
+	if err == nil {
+		m.sendOpusFrameLocked(opus)
+	} else {
+		m.noteSendError()
+	}
 }
 
 // nextMohFrameLocked devolve o próximo quadro (frameSize amostras) do loop de música
@@ -131,6 +158,8 @@ func (m *CallManager) onRelayData(data []byte) {
 }
 
 func (m *CallManager) handleAudioRelayData(data []byte) {
+	m.audioReceiveMu.Lock()
+	defer m.audioReceiveMu.Unlock()
 	m.mu.Lock()
 	if m.srtpSession == nil || m.codec == nil {
 		m.mu.Unlock()
@@ -149,31 +178,32 @@ func (m *CallManager) handleAudioRelayData(data []byte) {
 			go m.relay.ResendSubscriptions()
 		}
 	}
-	srtp := m.srtpSession
-	codec := m.codec
-	held := m.held
-	m.mu.Unlock()
-
-	pkt, err := srtp.Unprotect(data)
+	pkt, err := m.srtpSession.Unprotect(data)
 	if err != nil {
+		m.mu.Unlock()
 		m.log.Debug("srtp unprotect error", "err", err)
 		return
 	}
-	if len(pkt.Payload) == 0 {
+	if len(pkt.Payload) == 0 || m.peerAudioLateLocked(pkt.Header.Timestamp) {
+		m.mu.Unlock()
 		return
 	}
-	pcm, err := codec.Decode(pkt.Payload)
+	pcm, err := m.codec.Decode(pkt.Payload)
 	if err != nil || len(pcm) == 0 {
+		m.mu.Unlock()
 		return
 	}
-	if held {
+	// Mesmo em hold o decoder avança: registrar a timeline impede que o segundo
+	// relay decodifique de novo o mesmo pacote e mantém a retomada na posição atual.
+	pcm = m.alignPeerAudioLocked(pkt.Header.Timestamp, pcm)
+	if m.held {
+		m.mu.Unlock()
 		// Em espera: não encaminha o áudio do peer ao navegador do atendente.
 		return
 	}
-	if m.OnPeerAudio != nil {
-		if aligned := m.alignPeerAudio(pkt.Header.Timestamp, pcm); len(aligned) > 0 {
-			m.OnPeerAudio(aligned)
-		}
+	m.mu.Unlock()
+	if m.OnPeerAudio != nil && len(pcm) > 0 {
+		m.OnPeerAudio(pcm)
 	}
 }
 
@@ -181,9 +211,31 @@ func (m *CallManager) handleAudioRelayData(data []byte) {
 func (m *CallManager) PeerLateDrops() int64 { return m.peerLateDrops.Load() }
 
 func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
-	const maxGapSamples = 8000
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.alignPeerAudioLocked(ts, pcm)
+}
+
+const maxPeerGapSamples = 8000
+
+// peerAudioLateLocked roda ANTES de Decode: descartar depois já teria alterado
+// o estado do decoder. Mantém a janela frota6c e permite reinícios grandes.
+func (m *CallManager) peerAudioLateLocked(ts uint32) bool {
+	if !m.audioTimelineSet {
+		return false
+	}
+	gap := int64(uint64(ts-m.audioBaseTs)) - int64(m.audioPlayedSamples)
+	if gap < 0 && -gap <= maxPeerGapSamples {
+		m.peerLateDrops.Add(1)
+		return true
+	}
+	return false
+}
+
+func (m *CallManager) alignPeerAudioLocked(ts uint32, pcm []float32) []float32 {
+	if m.peerAudioLateLocked(ts) {
+		return nil
+	}
 	origLen := uint64(len(pcm))
 	if !m.audioTimelineSet {
 		m.audioTimelineSet = true
@@ -193,15 +245,7 @@ func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
 	}
 	target := uint64(ts - m.audioBaseTs)
 	gap := int64(target) - int64(m.audioPlayedSamples)
-	if gap < 0 && -gap <= maxGapSamples {
-		// [frota6c] Atrasado (retransmissão do SCTP não ordenado) ou duplicado (2º relay):
-		// o slot dele já saiu (com o áudio ou com o padding de silêncio). Reiniciar a
-		// timeline aqui mandava áudio velho fora de ordem para o fim do buffer e fazia o
-		// pacote seguinte ganhar padding falso — +120ms de lixo por pacote atrasado.
-		m.peerLateDrops.Add(1)
-		return nil
-	}
-	if gap < 0 || gap > maxGapSamples {
+	if gap < 0 || gap > maxPeerGapSamples {
 		m.audioBaseTs = ts
 		m.audioPlayedSamples = origLen
 		return pcm

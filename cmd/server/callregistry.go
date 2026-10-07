@@ -34,6 +34,9 @@ type activeCall struct {
 	// → segfault do motor (derruba TODAS as chamadas da célula). Atingível a cada re-offer do
 	// navegador (reload/ICE-restart/transferência).
 	mediaMu sync.Mutex
+	// Ordem: mediaMu -> reg.mu -> mutex interno do codec. reg.mu é liberado
+	// antes de Decode/Encode/Close. Nunca chamar cm (mu) sob mediaMu: callbacks
+	// OnStateChange rodam com cm.mu e podem esperar o fechamento da mídia.
 
 	// [upstream 4301d8f] timeout de toque (WACALLS_RING_TIMEOUT_SECONDS): expira a chamada
 	// de entrada que nunca recebe encerramento. Parado em remove()/drain()/stopRingTimer.

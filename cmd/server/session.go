@@ -299,6 +299,11 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 				under, trim, hard := pb.underruns, pb.trimmed, pb.hardDropped
 				ac.playoutMu.Unlock()
 				late := ac.cm.PeerLateDrops() // atômico; cm é fixo desde o createCall
+				send := ac.cm.DrainSendStats()
+				var jitterAvgMs float64
+				if send.JitterIntervals > 0 {
+					jitterAvgMs = float64(send.JitterTotal) / float64(time.Millisecond) / float64(send.JitterIntervals)
+				}
 				if el > 0 {
 					outSmpS := float64(250*playoutFrame48) / el
 					inSmpS := float64(in-lastIn) / el
@@ -310,7 +315,11 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 						"buf_ms", buf/48, "drop_delta", dr-lastDrop,
 						"target_ms", tgt, "underruns_delta", under-lastUnder,
 						"trimmed_delta", trim-lastTrim, "hard_drop_delta", hard-lastHard,
-						"late_pkts_delta", late-lastLate, "call_id", callID)
+						"late_pkts_delta", late-lastLate, "call_id", callID,
+						"capture_frames_delta", send.CaptureFrames, "capture_underruns_delta", send.CaptureUnderruns,
+						"capture_drop_smp_delta", send.CaptureDroppedSamples, "send_frames_delta", send.SentFrames,
+						"send_jitter_max_ms", float64(send.JitterMax)/float64(time.Millisecond), "send_jitter_avg_ms", jitterAvgMs,
+						"encode_max_ms", float64(send.EncodeMax)/float64(time.Millisecond), "send_errors_delta", send.Errors)
 				}
 				logStart, lastIn, lastDrop = now, in, dr
 				lastUnder, lastTrim, lastHard, lastLate = under, trim, hard, late
@@ -417,7 +426,8 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		// grava o lado do peer (WhatsApp) mesmo se o navegador ainda não estiver pronto
 		ac.recorder.writePeer(pcm16)
-		if ac.bridge == nil || ac.browserOpus == nil {
+		b, oc, found := s.reg.mediaOf(callID)
+		if !found || b == nil || oc == nil {
 			return
 		}
 		// [pacing BR 12/08] NÃO encoda+envia aqui. Antes, isto rodava na cadência de
@@ -521,9 +531,13 @@ func (s *Session) expireRingingCall(callID string) {
 	if ac.answered.Load() {
 		return // atendida (corrida com o timer): não expira
 	}
+	// RejectCall faz a decisão final sob o mesmo lock de AcceptCall. answered
+	// é apenas um atalho: pode mudar depois do Load acima.
+	if err := ac.cm.RejectCall(s.mgr.appCtx, callID, core.EndCallReasonTimeout); err != nil {
+		return
+	}
 	s.log.Info("chamada expirada por timeout de toque (nunca recebeu encerramento do WhatsApp)",
 		"call_id", callID, "timeout_s", ringTimeoutSecs)
-	_ = ac.cm.RejectCall(s.mgr.appCtx, callID, core.EndCallReasonTimeout)
 	s.removeCall(callID)
 	s.mgr.broker.endCall(callID, string(core.EndCallReasonTimeout))
 }
@@ -969,14 +983,23 @@ func (s *Session) removeCall(callID string) {
 	}
 	stopBrowserPlayout(ac) // [pacing BR 12/08] para o loop ANTES de fechar o codec cgo
 	s.finalizeRecording(ac)
-	if ac.bridge != nil {
-		ac.bridge.Close()
+	ac.closeMedia()
+}
+
+// closeMedia espera Decode/Encode e swaps. O registro já foi removido e o
+// playout já parou; fecha as pontes fora de mediaMu.
+func (ac *activeCall) closeMedia() {
+	ac.mediaMu.Lock()
+	oldB, oldWSB, oldOC := ac.bridge, ac.wsBridge, ac.browserOpus
+	if oldOC != nil {
+		oldOC.Close()
 	}
-	if ac.wsBridge != nil {
-		ac.wsBridge.Close()
+	ac.mediaMu.Unlock()
+	if oldB != nil {
+		oldB.Close()
 	}
-	if ac.browserOpus != nil {
-		ac.browserOpus.Close()
+	if oldWSB != nil {
+		oldWSB.Close()
 	}
 }
 
@@ -1016,15 +1039,7 @@ func (s *Session) teardownAllCalls() {
 		_ = ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
 		stopBrowserPlayout(ac) // [pacing BR 12/08] para o loop ANTES de fechar o codec cgo
 		s.finalizeRecording(ac)
-		if ac.bridge != nil {
-			ac.bridge.Close()
-		}
-		if ac.wsBridge != nil {
-			ac.wsBridge.Close()
-		}
-		if ac.browserOpus != nil {
-			ac.browserOpus.Close()
-		}
+		ac.closeMedia()
 	}
 }
 
@@ -1032,8 +1047,18 @@ func (s *Session) teardownAllCalls() {
 // mecanismo de setBridge: fecha a ponte anterior (WebRTC ou WS) sem disparar
 // o encerramento da chamada (DisableTerminate).
 func (s *Session) setWSBridge(callID string, b *wsBridge, oc media.Codec) {
+	ac, ok := s.reg.get(callID)
+	if !ok {
+		b.Close()
+		if oc != nil {
+			oc.Close()
+		}
+		return
+	}
+	ac.mediaMu.Lock()
 	oldWSB, oldB, oldOC, found := s.reg.setWSBridge(callID, b, oc)
 	if !found {
+		ac.mediaMu.Unlock()
 		b.Close()
 		if oc != nil {
 			oc.Close()
@@ -1042,14 +1067,20 @@ func (s *Session) setWSBridge(callID string, b *wsBridge, oc media.Codec) {
 	}
 	if oldB != nil {
 		oldB.DisableTerminate()
-		oldB.Close()
 	}
 	if oldWSB != nil {
 		oldWSB.DisableTerminate()
-		oldWSB.Close()
 	}
 	if oldOC != nil {
 		oldOC.Close()
+	}
+	// Close do WS pode esperar o handshake; libera mediaMu antes de fechar as pontes.
+	ac.mediaMu.Unlock()
+	if oldB != nil {
+		oldB.Close()
+	}
+	if oldWSB != nil {
+		oldWSB.Close()
 	}
 }
 

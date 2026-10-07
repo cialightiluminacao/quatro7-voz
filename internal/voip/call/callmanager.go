@@ -23,6 +23,10 @@ type CallManager struct {
 
 	mu          sync.Mutex
 	currentCall *CallInfo
+	// Ordem: audioReceiveMu -> mu. Serializa os relays até a entrega do PCM;
+	// Decode/Encode/Close usam mu. Callbacks de áudio rodam SEM mu, e nenhum
+	// caminho com mu travado pode adquirir audioReceiveMu (inclusive cleanup).
+	audioReceiveMu sync.Mutex
 
 	rtpSession  *media.RtpSession
 	srtpSession *media.SrtpSession
@@ -44,6 +48,9 @@ type CallManager struct {
 
 	captureBuf   []float32
 	sendLoopStop chan struct{}
+	sendStatsMu  sync.Mutex // mu -> sendStatsMu; o leitor nunca adquire mu
+	sendStats    SendStats
+	lastSend     time.Time
 
 	// Estado de espera (hold). Enquanto held, o áudio do atendente não é enviado:
 	// no lugar vai música de espera (mohEnabled) ou silêncio, e o áudio do peer não
@@ -248,7 +255,12 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 		m.mu.Unlock()
 		return &CallError{"no call with id " + callID}
 	}
-	_ = call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason})
+	// A transição compara o estado sob o mesmo mu de AcceptCall: se o aceite
+	// ganhou a corrida com o timeout, não envia reject nem limpa a mídia.
+	if err := call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason}); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	peer := wanode.MustJID(call.PeerJid)
 	// from=ownID no perfil do peer: LID p/ peer @lid, PN p/ peer @s.whatsapp.net.
 	own := m.sock.OwnLID()

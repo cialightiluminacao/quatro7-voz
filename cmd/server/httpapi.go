@@ -646,16 +646,7 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		browserOpus = nil
 	}
 	bridge.OnBrowserRTP = func(payload []byte) {
-		if browserOpus == nil {
-			return
-		}
-		pcm48, err := browserOpus.Decode(payload)
-		if err != nil {
-			return
-		}
-		down := media.Downsample48to16(pcm48)
-		ac.recorder.writeBrowser(down)
-		ac.cm.FeedCapturedPCM(down)
+		sess.feedBrowserAudio(callID, ac, browserOpus, payload)
 	}
 	bridge.OnBrowserVideo = func(au []byte) {
 		ac.cm.FeedCapturedVideo(au)
@@ -703,12 +694,12 @@ func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request)
 	}
 	// RejectCall envia o <reject> ao WhatsApp (encerra de fato a chamada de entrada).
 	err := ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
-	sess.removeCall(id)
-	s.broker.endCall(id, string(core.EndCallReasonDeclined))
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "status": "not_applied"})
 		return
 	}
+	sess.removeCall(id)
+	s.broker.endCall(id, string(core.EndCallReasonDeclined))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

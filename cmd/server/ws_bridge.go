@@ -204,16 +204,7 @@ func (s *server) handleWSBridge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bridge.OnBrowserRTP = func(payload []byte) {
-		if browserOpus == nil {
-			return
-		}
-		pcm48, err := browserOpus.Decode(payload)
-		if err != nil {
-			return
-		}
-		down := media.Downsample48to16(pcm48)
-		ac.recorder.writeBrowser(down)
-		ac.cm.FeedCapturedPCM(down)
+		sess.feedBrowserAudio(callID, ac, browserOpus, payload)
 	}
 	bridge.OnTerminalWS = func() {
 		go sess.terminateCall(callID, core.EndCallReasonUserEnded)

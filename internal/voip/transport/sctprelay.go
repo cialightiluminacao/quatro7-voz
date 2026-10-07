@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 	"wacalls/internal/voip/core"
 
@@ -84,7 +85,8 @@ type SctpRelayManager struct {
 
 	onConnected func(ip string, port int)
 
-	onReceive func(data []byte)
+	onReceive  func(data []byte)
+	sendErrors atomic.Int64 // somente envios de mídia via Broadcast
 }
 
 func NewSctpRelayManager(log *slog.Logger) *SctpRelayManager {
@@ -434,13 +436,15 @@ func (m *SctpRelayManager) sendConsentBinding(conn *relayConnection) {
 	}
 }
 
-func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) {
+func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) error {
 	if conn.channel == nil || conn.state != relayStateOpen {
-		return
+		return nil
 	}
 	if err := conn.channel.Send(data); err != nil {
 		m.log.Debug("relay send error", "id", conn.id, "err", err)
+		return err
 	}
+	return nil
 }
 
 func (m *SctpRelayManager) Broadcast(data []byte) {
@@ -451,9 +455,13 @@ func (m *SctpRelayManager) Broadcast(data []byte) {
 	}
 	m.mu.Unlock()
 	for _, c := range conns {
-		m.sendRaw(c, data)
+		if err := m.sendRaw(c, data); err != nil {
+			m.sendErrors.Add(1)
+		}
 	}
 }
+
+func (m *SctpRelayManager) DrainSendErrors() int64 { return m.sendErrors.Swap(0) }
 
 func (m *SctpRelayManager) countOpenLocked() int {
 	n := 0

@@ -1,6 +1,7 @@
 package call
 
 import (
+	"time"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/transport"
 )
@@ -94,11 +95,14 @@ func (m *CallManager) cleanupMedia() {
 	m.captureBuf = nil
 	m.audioTimelineSet = false
 	m.audioPlayedSamples = 0
+	m.lastSend = time.Time{}
+	// Espera qualquer Decode/Encode em andamento sob mu antes de destruir.
+	// Não segura mu durante relay.Cleanup(), que pode esperar callbacks.
+	if codec != nil {
+		codec.Close()
+	}
 	m.mu.Unlock()
 
 	m.video.Reset()
 	m.relay.Cleanup()
-	if codec != nil {
-		codec.Close()
-	}
 }
