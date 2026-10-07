@@ -258,16 +258,46 @@ func (s *server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		URL string `json:"url"`
+		URL    string   `json:"url"`
+		Secret string   `json:"secret"` // opcional: assina o payload (X-Webhook-Signature: sha256=…)
+		Events []string `json:"events"` // opcional: só entrega estes tipos; vazio = todos
 	}
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url required"})
 		return
 	}
 	url := strings.TrimSpace(b.URL)
-	sess.setWebhook(url)
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, url)
-	writeJSON(w, http.StatusOK, map[string]string{"webhook": url})
+	secret := strings.TrimSpace(b.Secret)
+	events := make([]string, 0, len(b.Events))
+	for _, e := range b.Events {
+		if e = strings.TrimSpace(e); e != "" {
+			events = append(events, e)
+		}
+	}
+	sess.setWebhook(url, secret, events)
+	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, url, secret, strings.Join(events, ","))
+	writeJSON(w, http.StatusOK, webhookView(sess))
+}
+
+// splitEvents divide um CSV de tipos de evento em lista, ignorando vazios/espaços.
+func splitEvents(csv string) []string {
+	var out []string
+	for _, p := range strings.Split(csv, ",") {
+		if e := strings.TrimSpace(p); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// webhookView é a representação devolvida por POST/GET do webhook. Nunca inclui
+// o secret em claro, só se há um configurado.
+func webhookView(sess *Session) map[string]any {
+	ev := sess.getWebhookEvents()
+	if ev == nil {
+		ev = []string{}
+	}
+	return map[string]any{"webhook": sess.getWebhook(), "hasSecret": sess.getWebhookSecret() != "", "events": ev}
 }
 
 func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
@@ -275,7 +305,7 @@ func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"webhook": sess.getWebhook()})
+	writeJSON(w, http.StatusOK, webhookView(sess))
 }
 
 func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +313,7 @@ func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	sess.setWebhook("")
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, "")
+	sess.setWebhook("", "", nil)
+	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, "", "", "")
 	w.WriteHeader(http.StatusNoContent)
 }

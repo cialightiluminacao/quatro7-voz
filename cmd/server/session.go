@@ -40,12 +40,14 @@ type Session struct {
 	waContainer *sqlstore.Container
 	waDB        *sql.DB
 
-	mu        sync.Mutex
-	auth      AuthSnapshot
-	webhook   string
-	chatwoot  ChatwootConfig
-	recording bool   // grava as chamadas desta sessão (opt-in)
-	proxy     string // proxy de saída da conexão WhatsApp (http/https/socks5)
+	mu            sync.Mutex
+	auth          AuthSnapshot
+	webhook       string
+	webhookSecret string   // assina o payload (X-Webhook-Signature); vazio = sem assinatura
+	webhookEvents []string // só entrega estes tipos de evento; vazio = todos
+	chatwoot      ChatwootConfig
+	recording     bool   // grava as chamadas desta sessão (opt-in)
+	proxy         string // proxy de saída da conexão WhatsApp (http/https/socks5)
 
 	// downAlerted evita repetir o aviso de "sessão desconectada" no Chatwoot
 	// enquanto ela segue caída; volta a false ao reconectar (events.Connected).
@@ -126,10 +128,41 @@ func (s *Session) sendAndMark(ctx context.Context, jid types.JID, msg *waE2E.Mes
 	return resp.ID, nil
 }
 
-func (s *Session) setWebhook(url string) {
+func (s *Session) setWebhook(url, secret string, events []string) {
 	s.mu.Lock()
 	s.webhook = url
+	s.webhookSecret = secret
+	s.webhookEvents = events
 	s.mu.Unlock()
+}
+
+func (s *Session) getWebhookSecret() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webhookSecret
+}
+
+func (s *Session) getWebhookEvents() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.webhookEvents
+}
+
+// webhookWants diz se o evento deve ser entregue conforme o filtro da sessão.
+// Filtro vazio = entrega tudo (comportamento antigo).
+func (s *Session) webhookWants(event string) bool {
+	s.mu.Lock()
+	ev := s.webhookEvents
+	s.mu.Unlock()
+	if len(ev) == 0 {
+		return true
+	}
+	for _, e := range ev {
+		if e == event {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) getWebhook() string {

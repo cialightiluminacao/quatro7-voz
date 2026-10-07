@@ -183,7 +183,7 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		s := newSession(m, row.ID, row.Name, client)
 		s.waContainer = container
 		s.waDB = db
-		s.setWebhook(row.Webhook)
+		s.setWebhook(row.Webhook, row.WebhookSecret, splitEvents(row.WebhookEvents))
 		s.setRecording(row.Recording)
 		s.setProxy(row.Proxy)
 		if row.Chatwoot != "" {

@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -18,9 +21,10 @@ var webhookClient = &http.Client{Timeout: 10 * time.Second}
 // de forma assíncrona. Formato: {session, event, timestamp, data}.
 func (s *Session) dispatchWebhook(event string, data any) {
 	url := s.getWebhook()
-	if url == "" {
+	if url == "" || !s.webhookWants(event) {
 		return
 	}
+	secret := s.getWebhookSecret()
 	body, err := json.Marshal(map[string]any{
 		"session":   s.id,
 		"event":     event,
@@ -36,6 +40,9 @@ func (s *Session) dispatchWebhook(event string, data any) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if secret != "" {
+			req.Header.Set("X-Webhook-Signature", assinaWebhook(secret, body))
+		}
 		resp, err := webhookClient.Do(req)
 		if err != nil {
 			s.log.Debug("webhook post failed", "url", url, "err", err)
@@ -43,6 +50,13 @@ func (s *Session) dispatchWebhook(event string, data any) {
 		}
 		_ = resp.Body.Close()
 	}()
+}
+
+// assinaWebhook devolve "sha256=<hex>" do HMAC-SHA256 do corpo com o secret.
+func assinaWebhook(secret string, body []byte) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write(body)
+	return "sha256=" + hex.EncodeToString(m.Sum(nil))
 }
 
 // summarizeMessage extrai os campos úteis de uma mensagem recebida e inclui o

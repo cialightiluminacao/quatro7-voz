@@ -105,10 +105,8 @@ func (s *Socket) ResolveLIDForPN(ctx context.Context, pn types.JID) types.JID {
 	// o destino NÃO tocava (bug 02/10). Resolver pelo servidor garante o LID certo.
 	if s.cli != nil {
 		if resp, err := s.cli.IsOnWhatsApp(ctx, []string{pn.User}); err == nil {
-			for _, r := range resp {
-				if r.IsIn && r.JID.Server == types.HiddenUserServer && !r.JID.IsEmpty() {
-					return r.JID
-				}
+			if lid := lidDaResposta(ctx, s.cli, pn, resp); !lid.IsEmpty() {
+				return lid
 			}
 		}
 	}
@@ -119,4 +117,22 @@ func (s *Socket) ResolveLIDForPN(ctx context.Context, pn types.JID) types.JID {
 		}
 	}
 	return pn
+}
+
+// lidMapper grava o par PN<->LID no store (satisfeito por *whatsmeow.Client).
+type lidMapper interface {
+	StoreLIDPNMapping(ctx context.Context, lid, pn types.JID)
+}
+
+// lidDaResposta extrai o LID da resposta do IsOnWhatsApp e GRAVA o par PN<->LID.
+// O par gravado alimenta o mapa local (whatsmeow_lid_map) e o espelhamento do TC
+// token, evitando o 463 em ligação de saída para contato frio (7e60e3d, item B1).
+func lidDaResposta(ctx context.Context, m lidMapper, pn types.JID, resp []types.IsOnWhatsAppResponse) types.JID {
+	for _, r := range resp {
+		if r.IsIn && r.JID.Server == types.HiddenUserServer && !r.JID.IsEmpty() {
+			m.StoreLIDPNMapping(ctx, r.JID, pn)
+			return r.JID
+		}
+	}
+	return types.JID{}
 }
