@@ -1,6 +1,7 @@
 package video
 
 import (
+	"bytes"
 	"time"
 	"wacalls/internal/voip/media"
 	"wacalls/internal/voip/transport"
@@ -124,18 +125,41 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	}
 	if !r.damaged {
 		r.auBytes += len(pkt.Payload)
+		payload := pkt.Payload
+		fuActive, fuHeader := r.fuActive, r.fuHeader
+		paddingValid := true
+		if h.Padding {
+			paddingValid = len(payload) > 0 && payload[len(payload)-1] != 0 && int(payload[len(payload)-1]) <= len(payload)
+			if paddingValid {
+				payload = payload[:len(payload)-int(payload[len(payload)-1])]
+			}
+		}
 		if r.auBytes > maxReceiveAUBytes {
+			p.logReceivePayloadLocked(pkt, "access-unit-limit", fuActive, fuHeader)
 			p.discardReceiveAULocked("access-unit-limit")
-		} else if !r.validPayload(pkt.Payload) {
+		} else if !paddingValid {
+			p.logReceivePayloadLocked(pkt, "invalid-rtp-padding", fuActive, fuHeader)
+			p.discardReceiveAULocked("invalid-rtp-padding")
+		} else if !r.validPayload(payload) {
+			p.logReceivePayloadLocked(pkt, "invalid-h264-payload", fuActive, fuHeader)
 			p.discardReceiveAULocked("invalid-h264-payload")
 		} else {
-			for _, nalu := range p.depack.Depacketize(pkt.Payload) {
+			p.logReceivePayloadLocked(pkt, "", fuActive, fuHeader)
+			for _, nalu := range p.depack.Depacketize(payload) {
 				if len(p.frameBuf)+len(nalu)+4 > maxReceiveAUBytes {
 					p.discardReceiveAULocked("access-unit-limit")
 					break
 				}
-				p.frameBuf = append(p.frameBuf, annexBStartCode...)
-				p.frameBuf = append(p.frameBuf, nalu...)
+				// O meowcaller também reconstrói FU-A cujo tipo original é 0
+				// ou privado. Se o corpo já é Annex-B, o header sintetizado
+				// não é uma NAL: preservar só o stream, sem inserir tipo 0/30.
+				kind := nalu[0] & 31
+				if (kind == 0 || kind > 23) && (bytes.HasPrefix(nalu[1:], annexBStartCode) || bytes.HasPrefix(nalu[1:], []byte{0, 0, 1})) {
+					p.frameBuf = append(p.frameBuf, nalu[1:]...)
+				} else {
+					p.frameBuf = append(p.frameBuf, annexBStartCode...)
+					p.frameBuf = append(p.frameBuf, nalu...)
+				}
 			}
 		}
 	}
@@ -232,7 +256,14 @@ func (r *receiveState) validPayload(payload []byte) bool {
 		if r.fuActive || len(payload) < 4 {
 			return false
 		}
+		haveNAL := false
 		for body := payload[1:]; len(body) > 0; {
+			// A referência devolve as NALs já completas quando encontra
+			// um tail de zeros. Aceitar esse padding sem aceitar uma NAL
+			// truncada ou um agregado vazio.
+			if haveNAL && len(bytes.Trim(body, "\x00")) == 0 {
+				return true
+			}
 			if len(body) < 2 {
 				return false
 			}
@@ -242,16 +273,18 @@ func (r *receiveState) validPayload(payload []byte) bool {
 				return false
 			}
 			body = body[size:]
+			haveNAL = true
 		}
 		return true
 	case kind == 28:
-		if len(payload) < 3 {
+		if len(payload) < 2 {
 			return false
 		}
 		start, end, typ := payload[1]&0x80 != 0, payload[1]&0x40 != 0, payload[1]&0x1f
-		if payload[1]&0x20 != 0 || (start && end) || typ == 0 || typ > 23 {
-			return false
-		}
+		// Compatibilidade com meowcaller rtp/h264.go: S+E numa FU pequena,
+		// fragmentos vazios e todos os 5 bits de tipo original. R é ignorado
+		// pelo receptor conforme RFC 6184 §5.8. Sequência, header e limites
+		// continuam estritos; não se adivinha nem remove prefixo proprietário.
 		header := payload[0]&0xe0 | typ
 		if start {
 			if r.fuActive {

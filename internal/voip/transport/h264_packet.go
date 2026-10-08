@@ -1,5 +1,7 @@
 package transport
 
+import "bytes"
+
 const (
 	h264StapAType = 24
 	h264FuaType   = 28
@@ -152,6 +154,24 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 	case naluType == h264StapAType:
 		d.fuActive = false
 		body := payload[1:]
+		// Validar todo o agregado antes de emitir NALs: um IDR no prefixo
+		// de um STAP truncado não pode recuperar um decoder.
+		haveNAL := false
+		for rest := body; len(rest) > 0; {
+			if haveNAL && len(bytes.Trim(rest, "\x00")) == 0 {
+				break // padding zero após NALs completas, como na referência
+			}
+			if len(rest) < 2 {
+				return nil
+			}
+			size := int(rest[0])<<8 | int(rest[1])
+			rest = rest[2:]
+			if size == 0 || size > len(rest) {
+				return nil
+			}
+			rest = rest[size:]
+			haveNAL = true
+		}
 		var out [][]byte
 		for len(body) >= 2 {
 			size := int(body[0])<<8 | int(body[1])
@@ -178,13 +198,18 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 		body := payload[2:]
 
 		if startBit != 0 {
+			if 1+len(body) > maxFuReassemblyBytes {
+				d.fuActive = false
+				d.fuBuf = d.fuBuf[:0]
+				return nil
+			}
 			d.fuActive = true
 			d.fuType = origType
 			d.fuNriF = fbitAndNri
 			d.fuBuf = append(d.fuBuf[:0], fbitAndNri|origType)
 			d.fuBuf = append(d.fuBuf, body...)
 		} else if d.fuActive {
-			if len(d.fuBuf)+len(body) > maxFuReassemblyBytes {
+			if origType != d.fuType || fbitAndNri != d.fuNriF || len(d.fuBuf)+len(body) > maxFuReassemblyBytes {
 				d.fuActive = false
 				d.fuBuf = d.fuBuf[:0]
 				return nil

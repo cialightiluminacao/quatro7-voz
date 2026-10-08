@@ -1,6 +1,7 @@
 package video
 
 import (
+	"encoding/hex"
 	"time"
 
 	"wacalls/internal/voip/media"
@@ -31,6 +32,58 @@ type videoDiagnostics struct {
 	pliSent, pliErrors                                                  uint64
 	rxBrowserKF, rxDeltaWhileWaiting                                    uint64
 	rxSsrcChanges                                                       uint64
+	rxAcceptedSamples, rxRejectedSamples                                uint8
+	txDeltaSamples, txIDRSamples                                        uint8
+}
+
+// Orçamento fixo por chamada: até 6 aceitos + 16 rejeitados, mesmo após rekey.
+// Somente RTP autenticado chega aqui. O hex é do payload original, antes do
+// padding RTP, limitado a 24 bytes; nenhum frame completo é registrado.
+func (p *Pipeline) logReceivePayloadLocked(pkt *media.RtpPacket, reason string, fuActive bool, fuHeader byte) {
+	result, count, limit := "accepted", &p.diag.rxAcceptedSamples, uint8(6)
+	if reason != "" {
+		result, count, limit = "rejected", &p.diag.rxRejectedSamples, 16
+	}
+	if *count >= limit {
+		return
+	}
+	*count++
+	h, payload := pkt.Header, pkt.Payload
+	kind, fuType := -1, -1
+	start, end, reserved := false, false, false
+	if len(payload) > 0 {
+		kind = int(payload[0] & 31)
+	}
+	if kind == 28 && len(payload) >= 2 {
+		fuType = int(payload[1] & 31)
+		start, end, reserved = payload[1]&0x80 != 0, payload[1]&0x40 != 0, payload[1]&0x20 != 0
+	}
+	prefix := payload[:min(len(payload), 24)]
+	p.log.Info("video receive H264 payload sample", "call_id", p.callID,
+		"result", result, "sample", *count, "reason", reason,
+		"pt", h.PayloadType, "marker", h.Marker, "seq", h.SequenceNumber, "ts", h.Timestamp, "ssrc", h.Ssrc,
+		"payload_bytes", len(payload), "payload_hex", hex.EncodeToString(prefix), "rtp_padding", h.Padding,
+		"nal_type", kind, "fu_type", fuType, "fu_start", start, "fu_end", end, "fu_reserved", reserved,
+		"fu_active_before", fuActive, "fu_header_before", fuHeader)
+}
+
+func (p *Pipeline) logCapturedH264Locked(idr bool, auBytes, packedBytes, packets int, timestamp, step uint32) {
+	count, limit := &p.diag.txDeltaSamples, uint8(4)
+	if idr {
+		count, limit = &p.diag.txIDRSamples, 8
+	}
+	if *count >= limit {
+		return
+	}
+	*count++
+	profile, constraints, level := -1, -1, -1
+	if len(p.sendSPS) >= 4 {
+		profile, constraints, level = int(p.sendSPS[1]), int(p.sendSPS[2]), int(p.sendSPS[3])
+	}
+	p.log.Info("video transmit H264 sample", "call_id", p.callID, "sample", *count, "idr", idr,
+		"au_bytes", auBytes, "packed_bytes", packedBytes, "packets", packets, "ts", timestamp, "ts_step", step,
+		"sps_bytes", len(p.sendSPS), "pps_bytes", len(p.sendPPS),
+		"profile_idc", profile, "profile_iop", constraints, "level_idc", level)
 }
 
 func countReason(counts *map[string]uint64, reason string) {

@@ -45,7 +45,7 @@ type Pipeline struct {
 	depack        *transport.H264Depacketizer
 	frameBuf      []byte
 	firstAUAt     time.Time
-	clockTicks    uint32
+	clockTicks    uint64
 	now           func() time.Time
 	afterFunc     func(time.Duration, func()) *time.Timer
 	lastKFAt      time.Time
@@ -57,6 +57,7 @@ type Pipeline struct {
 	rtpOrientationKnown    bool
 	receive                receiveState
 	receiveSPS, receivePPS []byte
+	sendSPS, sendPPS       []byte
 	reorder                videoReorder
 	receiveTimer           *time.Timer
 	receiveEpoch           uint64
@@ -214,12 +215,52 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		countReason(&p.diag.txDrops, "not-ready-or-empty")
 		return
 	}
+	if len(au) > maxReceiveAUBytes {
+		countReason(&p.diag.txDrops, "access-unit-limit")
+		p.keyframeRequired = true
+		requestKeyframe = p.requestKeyframeLocked(p.now())
+		return
+	}
 	nalus := transport.SplitAnnexB(au)
 	if len(nalus) == 0 {
 		countReason(&p.diag.txDrops, "invalid-annexb")
 		return
 	}
 	idr := hasIDR(nalus)
+	haveSPS, havePPS := false, false
+	for _, n := range nalus {
+		switch n[0] & 31 {
+		case 7:
+			p.sendSPS = append([]byte(nil), n...)
+			haveSPS = true
+		case 8:
+			p.sendPPS = append([]byte(nil), n...)
+			havePPS = true
+		}
+	}
+	// Repetir parameter sets conhecidos em cada IDR, mesmo se o encoder
+	// só os tiver entregue na configuração inicial. Nunca duplicar os da AU.
+	if idr {
+		var prefix [][]byte
+		if !haveSPS && len(p.sendSPS) > 0 {
+			prefix = append(prefix, p.sendSPS)
+		}
+		nalus = append(prefix, nalus...)
+		if !havePPS && len(p.sendPPS) > 0 {
+			// PPS depois do SPS já presente, antes da primeira slice.
+			at := len(nalus)
+			for i, n := range nalus {
+				if kind := n[0] & 31; kind >= 1 && kind <= 5 {
+					at = i
+					break
+				}
+			}
+			withPPS := make([][]byte, 0, len(nalus)+1)
+			withPPS = append(withPPS, nalus[:at]...)
+			withPPS = append(withPPS, p.sendPPS)
+			nalus = append(withPPS, nalus[at:]...)
+		}
+	}
 	now := p.now()
 	if now.Sub(at) >= transport.VideoMaxAge {
 		countReason(&p.diag.txDrops, "capture-age")
@@ -262,17 +303,30 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		countReason(&p.diag.txDrops, "empty-payload")
 		return
 	}
+	if len(packed) > maxReceiveAUBytes {
+		countReason(&p.diag.txDrops, "access-unit-limit")
+		p.keyframeRequired = true
+		requestKeyframe = p.requestKeyframeLocked(now)
+		return
+	}
+	var timestampStep uint32
 	if p.firstAUAt.IsZero() {
-		p.firstAUAt = now
+		p.firstAUAt = at
 	} else {
-		// Âncora na primeira AU enviada: inclui pausas/drops e não acumula erros
-		// de arredondamento. time.Now.Sub usa o relógio monotônico quando disponível.
-		elapsed := now.Sub(p.firstAUAt)
+		// Usar a chegada da AU, antes dos locks, para não comprimir/alongar
+		// frames pela espera na packetização. Clock 90 kHz inclui pausas/drops.
+		elapsed := at.Sub(p.firstAUAt)
+		var ticks uint64
 		if elapsed > 0 {
-			ticks := uint32(elapsed/time.Second)*90000 + uint32(elapsed%time.Second*90000/time.Second)
-			rtp.AdvanceTimestamp(ticks - p.clockTicks)
-			p.clockTicks = ticks
+			ticks = uint64(elapsed/time.Second)*90000 + uint64(elapsed%time.Second*90000/time.Second)
 		}
+		// Duas AUs na mesma unidade de clock não podem ter o mesmo timestamp.
+		if ticks <= p.clockTicks {
+			ticks = p.clockTicks + 1
+		}
+		timestampStep = uint32(ticks - p.clockTicks)
+		rtp.AdvanceTimestamp(timestampStep)
+		p.clockTicks = ticks
 	}
 	mediaFrameInfo := uint8(videoMediaFrameDelta)
 	if idr {
@@ -294,6 +348,7 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		tseq++
 		packets = append(packets, pkt)
 	}
+	p.logCapturedH264Locked(idr, len(au), len(packed), len(packets), packets[0].Header.Timestamp, timestampStep)
 
 	p.transportSeq = tseq
 	p.frameNumber = frameNum + 1
@@ -332,7 +387,7 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		p.diag.srOctets += uint32(len(pkt.Payload))
 		p.diag.srTimestamp = pkt.Header.Timestamp
 	}
-	p.diag.srRtpAt = now
+	p.diag.srRtpAt = at
 	// Um monitor que começou só para recepção pode estar aguardando 5 s.
 	// Reagenda para começar os SR de envio em 1,5 s.
 	if firstRTP {
@@ -461,6 +516,7 @@ func (p *Pipeline) resetLocked() {
 	p.peerPLICount = 0
 	p.rtcpSeen = nil
 	p.receiveSPS, p.receivePPS = nil, nil
+	p.sendSPS, p.sendPPS = nil, nil
 	p.stopMonitorLocked()
 	p.diag = videoDiagnostics{}
 }
