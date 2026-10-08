@@ -41,7 +41,7 @@ func ringingTimeoutSession() (*Session, *activeCall) {
 
 func ringingTimeoutSessionWithSocket(sock core.VoipSocket) (*Session, *activeCall) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := &Session{log: log, reg: newCallRegistry(), mgr: &SessionManager{appCtx: context.Background(), broker: NewBroker()}}
+	s := &Session{id: "s1", log: log, reg: newCallRegistry(), mgr: &SessionManager{appCtx: context.Background(), broker: NewBroker()}}
 	cm := call.NewCallManager(sock, log)
 	peer := types.NewJID("123", types.HiddenUserServer)
 	cm.HandleCallOffer(context.Background(), &waBinary.Node{Tag: "call", Content: []waBinary.Node{
@@ -49,7 +49,7 @@ func ringingTimeoutSessionWithSocket(sock core.VoipSocket) (*Session, *activeCal
 	}}, peer)
 	ac := &activeCall{cm: cm, browserOpus: &browserTestCodec{}}
 	s.reg.add("c1", ac)
-	s.mgr.broker.upsertCall(CallRecord{CallID: "c1", Status: StatusRinging})
+	s.mgr.broker.upsertCall(CallRecord{SessionID: s.id, CallID: "c1", Status: StatusRinging})
 	return s, ac
 }
 
@@ -68,7 +68,7 @@ func TestExpireRingingCallHonorsAcceptanceEvenWithoutAnsweredFlag(t *testing.T) 
 	if _, ok := s.reg.get("c1"); !ok || ac.browserOpus.(*browserTestCodec).closed.Load() {
 		t.Fatal("timeout removeu/fechou chamada já aceita")
 	}
-	if _, ok := s.mgr.broker.getCall("c1"); !ok || ac.cm.CurrentCall().IsEnded() {
+	if _, ok := s.mgr.broker.getCall(s.id, "c1"); !ok || ac.cm.CurrentCall().IsEnded() {
 		t.Fatal("timeout publicou encerramento de chamada aceita")
 	}
 }

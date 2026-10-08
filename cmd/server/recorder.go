@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -59,9 +60,10 @@ type recFrame struct {
 // mídia) só copiam o frame e fazem um send não-bloqueante; toda a mixagem roda
 // numa única goroutine, então o buffer mixado não precisa de lock.
 type callRecorder struct {
-	callID string
-	start  time.Time
-	log    *slog.Logger
+	sessionID string
+	callID    string
+	start     time.Time
+	log       *slog.Logger
 
 	frames chan recFrame
 	mixed  []float32
@@ -90,13 +92,14 @@ type callRecorder struct {
 	finishedOK   bool
 }
 
-func newCallRecorder(callID string, log *slog.Logger, start time.Time) *callRecorder {
+func newCallRecorder(sessionID, callID string, log *slog.Logger, start time.Time) *callRecorder {
 	r := &callRecorder{
-		callID:  callID,
-		start:   start,
-		log:     log,
-		frames:  make(chan recFrame, recChanCap),
-		doneMix: make(chan struct{}),
+		sessionID: sessionID,
+		callID:    callID,
+		start:     start,
+		log:       log,
+		frames:    make(chan recFrame, recChanCap),
+		doneMix:   make(chan struct{}),
 	}
 	go r.mixLoop()
 	return r
@@ -229,7 +232,14 @@ func (r *callRecorder) finish() (path string, seconds int, ok bool) {
 			r.finishedOK = false
 			return
 		}
+		// O nome continua <callId>.mp3: o BFF cai nesse nome quando o webhook vem sem url
+		// (WACALLS_PUBLIC_BASE_URL vazio em produção). Ligação entre duas caixas no MESMO
+		// motor tem o mesmo call-id nas duas pontas: a segunda a terminar não sobrescreve
+		// a primeira e grava <callId>-<sessão>.mp3 (a url do webhook carrega esse nome).
 		outPath := filepath.Join(dir, r.callID+".mp3")
+		if _, err := os.Stat(outPath); err == nil {
+			outPath = filepath.Join(dir, r.callID+"-"+recordingSessionSuffix(r.sessionID)+".mp3")
+		}
 		if err := encodeMP3(outPath, r.mixed); err != nil {
 			r.log.Warn("recording encode failed", "call_id", r.callID, "err", err)
 			r.finishedOK = false
@@ -261,4 +271,21 @@ func float32ToLE(pcm []float32) []byte {
 		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(s))
 	}
 	return buf
+}
+
+// recordingSessionSuffix: até 12 caracteres seguros da sessão (ids de sessão são hex).
+func recordingSessionSuffix(sessionID string) string {
+	var b strings.Builder
+	for _, c := range sessionID {
+		if b.Len() >= 12 {
+			break
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() == 0 {
+		return "s"
+	}
+	return b.String()
 }

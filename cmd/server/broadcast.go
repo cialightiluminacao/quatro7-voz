@@ -270,7 +270,7 @@ func (s *Session) broadcastOne(camp *broadcastCampaign, number string, pcm []flo
 	deadline := time.Now().Add(time.Duration(ringMs) * time.Millisecond)
 	answered := false
 	for time.Now().Before(deadline) {
-		rec, ok := s.mgr.broker.getCall(callID)
+		rec, ok := s.mgr.broker.getCall(s.id, callID)
 		if !ok || rec == nil {
 			time.Sleep(150 * time.Millisecond)
 			continue
@@ -311,7 +311,7 @@ func (s *Session) pumpAudio(callID string, pcm []float32, hangupAfterMs int) int
 		if hangupAfterMs > 0 && time.Since(start) >= time.Duration(hangupAfterMs)*time.Millisecond {
 			break
 		}
-		rec, ok := s.mgr.broker.getCall(callID)
+		rec, ok := s.mgr.broker.getCall(s.id, callID)
 		if !ok || rec == nil || rec.Status == StatusEnded {
 			break // a outra ponta desligou
 		}

@@ -251,7 +251,7 @@ func (s *Session) createCall(callID string, record bool) *call.CallManager {
 	// um teardown veria stopPlayout/playoutDone nil.
 	ac := &activeCall{cm: cm, stopPlayout: make(chan struct{}), playoutDone: make(chan struct{})}
 	if record {
-		ac.recorder = newCallRecorder(callID, s.log, time.Now())
+		ac.recorder = newCallRecorder(s.id, callID, s.log, time.Now())
 	}
 	s.reg.add(callID, ac)
 	s.startBrowserPlayout(callID, ac) // [pacing BR 12/08] loop de 20ms p/ o browser
@@ -395,7 +395,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
 			s.removeCall(c.CallID)
-			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
+			s.mgr.broker.endCall(s.id, c.CallID, string(c.StateData.EndReason))
 			return
 		}
 		// [upstream 4301d8f] atendida: marca e cancela o timeout de toque (não expirar).
@@ -412,7 +412,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if c.Direction == core.CallDirectionIncoming {
 			dir = "inbound"
 		}
-		existing, _ := s.mgr.broker.getCall(c.CallID)
+		existing, _ := s.mgr.broker.getCall(s.id, c.CallID)
 		rec := CallRecord{
 			SessionID: s.id, CallID: c.CallID, Direction: dir, Peer: c.PeerJid,
 			StartedAt: time.Now().UnixMilli(), Status: mapStatus(c.StateData.State),
@@ -426,7 +426,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
 		s.removeCall(c.CallID)
-		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
+		s.mgr.broker.endCall(s.id, c.CallID, string(c.StateData.EndReason))
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
 		ac, ok := s.reg.get(callID)
@@ -561,7 +561,7 @@ func (s *Session) expireRingingCall(callID string) {
 	s.log.Info("chamada expirada por timeout de toque (nunca recebeu encerramento do WhatsApp)",
 		"call_id", callID, "timeout_s", ringTimeoutSecs)
 	s.removeCall(callID)
-	s.mgr.broker.endCall(callID, string(core.EndCallReasonTimeout))
+	s.mgr.broker.endCall(s.id, callID, string(core.EndCallReasonTimeout))
 }
 
 func (s *Session) rejectOffer(ctx context.Context, node *waBinary.Node, from types.JID) {
@@ -1107,7 +1107,7 @@ func (s *Session) finalizeRecording(ac *activeCall) {
 	rec := ac.recorder
 	callID := rec.callID
 	peer := ""
-	if cr, ok := s.mgr.broker.getCall(callID); ok && cr != nil {
+	if cr, ok := s.mgr.broker.getCall(s.id, callID); ok && cr != nil {
 		peer = cr.Peer
 	}
 	go func() {

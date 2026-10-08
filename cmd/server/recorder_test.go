@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log/slog"
 	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -119,7 +124,7 @@ func TestPlace_SidesStayAligned(t *testing.T) {
 }
 
 func TestRecorder_DrainsBothSides(t *testing.T) {
-	r := newCallRecorder("TESTCALL", slog.Default(), time.Now().Add(-2*time.Second))
+	r := newCallRecorder("s1", "TESTCALL", slog.Default(), time.Now().Add(-2*time.Second))
 	r.writePeer(make([]float32, 320))
 	r.writeBrowser(make([]float32, 320))
 	r.closeFrames()
@@ -130,7 +135,7 @@ func TestRecorder_DrainsBothSides(t *testing.T) {
 }
 
 func TestRecorder_WriteAfterCloseDoesNotPanic(t *testing.T) {
-	r := newCallRecorder("RACECALL", slog.Default(), time.Now())
+	r := newCallRecorder("s1", "RACECALL", slog.Default(), time.Now())
 	r.writePeer(make([]float32, 160))
 	r.closeFrames()
 	<-r.doneMix
@@ -180,5 +185,48 @@ func TestRecordingPublicURL(t *testing.T) {
 	t.Setenv("WACALLS_PUBLIC_BASE_URL", "")
 	if recordingPublicURL("/tmp/x.mp3") != "" {
 		t.Fatal("expected empty URL when base not configured")
+	}
+}
+
+func TestRecordingsWithSameCallIDKeepBothSessionFiles(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required for recording integration")
+	}
+	t.Setenv("WACALLS_RECORDING_DIR", t.TempDir())
+	t.Setenv("WACALLS_PUBLIC_BASE_URL", "https://voice.example.com")
+	t.Setenv("WACALLS_API_KEY", "")
+	var paths []string
+	var recordings [][]byte
+	for i, sid := range []string{"s1", "s2"} {
+		rec := newCallRecorder(sid, "SAME_CALL_ID", slog.Default(), time.Now())
+		pcm := make([]float32, recSampleRate*recMinSeconds)
+		for j := range pcm {
+			pcm[j] = float32(0.25 * math.Sin(float64(j)*2*math.Pi*float64(440*(i+1))/recSampleRate))
+		}
+		rec.writePeer(pcm)
+		path, seconds, ok := rec.finish()
+		if !ok || seconds != recMinSeconds || !safeRecordingID(filepath.Base(path)) {
+			t.Fatalf("recording failed: path=%q seconds=%d ok=%t", path, seconds, ok)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			t.Fatalf("empty recording: %v", err)
+		}
+		paths = append(paths, path)
+		recordings = append(recordings, data)
+	}
+	if filepath.Base(paths[0]) != "SAME_CALL_ID.mp3" || filepath.Base(paths[1]) != "SAME_CALL_ID-s2.mp3" {
+		t.Fatalf("nomes inesperados: %q %q", filepath.Base(paths[0]), filepath.Base(paths[1]))
+	}
+	if paths[0] == paths[1] || bytes.Equal(recordings[0], recordings[1]) {
+		t.Fatal("same-ID session recordings collided")
+	}
+	handler := (&server{}).routes()
+	for i, path := range paths {
+		url := recordingPublicURL(path)
+		w := scopeRequest(handler, http.MethodGet, url, "", "")
+		if w.Code != http.StatusOK || !bytes.Equal(w.Body.Bytes(), recordings[i]) {
+			t.Fatalf("recording %d was overwritten or unavailable: status=%d", i, w.Code)
+		}
 	}
 }

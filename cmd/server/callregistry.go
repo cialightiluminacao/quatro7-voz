@@ -47,6 +47,9 @@ type activeCall struct {
 	answered  atomic.Bool // a chamada ficou ativa (atendida) — não expirar
 }
 
+// callRegistry belongs to exactly one Session (Session.reg), so its call-ID
+// indexes, timers and browser bridges are already scoped by that owning session.
+// Never share a registry between sessions or resolve a call across registries.
 type callRegistry struct {
 	mu    sync.Mutex
 	calls map[string]*activeCall

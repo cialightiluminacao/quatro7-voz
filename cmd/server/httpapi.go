@@ -515,7 +515,7 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 
 	ac.bridgeOpMu.Lock()
 	defer ac.bridgeOpMu.Unlock()
-	if _, exists := s.broker.getCall(id); !exists {
+	if _, exists := s.broker.getCall(sess.id, id); !exists {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
@@ -530,12 +530,12 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	ac.transferTarget = strings.TrimSpace(body.To)
 
 	from := clientID(r)
-	if !s.broker.reassignOwner(id, nil) {
+	if !s.broker.reassignOwner(sess.id, id, nil) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
 	peer := ""
-	if cr, ok := s.broker.getCall(id); ok && cr != nil {
+	if cr, ok := s.broker.getCall(sess.id, id); ok && cr != nil {
 		peer = cr.Peer
 	}
 	s.broker.emitTransferOffer(sess.id, id, peer, from, strings.TrimSpace(body.To))
@@ -568,7 +568,7 @@ func (s *server) handlePickup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "transfer targets another client"})
 		return
 	}
-	if !s.broker.claimTransferred(id, owner) {
+	if !s.broker.claimTransferred(sess.id, id, owner) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "call unavailable or claimed by another client"})
 		return
 	}
@@ -714,7 +714,7 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 	// Antes bloqueávamos o operador de aceitar uma 2ª chamada com uma já ativa. Agora
 	// permitimos "atender em espera": o painel coloca a atual em hold e aceita a nova.
 	// Mantemos só a reivindicação de dono (evita dois clientes pegarem a mesma chamada).
-	if !s.broker.setOwner(id, owner) {
+	if !s.broker.setOwner(sess.id, id, owner) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "claimed by another client"})
 		return
 	}
@@ -744,7 +744,7 @@ func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	sess.removeCall(id)
-	s.broker.endCall(id, string(core.EndCallReasonDeclined))
+	s.broker.endCall(sess.id, id, string(core.EndCallReasonDeclined))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -754,7 +754,7 @@ func (s *server) doEndCall(sess *Session, w http.ResponseWriter, r *http.Request
 		_ = ac.cm.EndCall(r.Context(), core.EndCallReasonUserEnded)
 	}
 	sess.removeCall(id)
-	s.broker.endCall(id, string(core.EndCallReasonUserEnded))
+	s.broker.endCall(sess.id, id, string(core.EndCallReasonUserEnded))
 	w.WriteHeader(http.StatusNoContent)
 }
 

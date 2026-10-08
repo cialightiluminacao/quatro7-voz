@@ -185,7 +185,7 @@ func TestHTTPTransferMissingBrokerCallPreservesBrowser(t *testing.T) {
 	bridge := &Bridge{}
 	sess.setBridge("c1", bridge, &browserTestCodec{})
 	sess.mgr.broker.mu.Lock()
-	delete(sess.mgr.broker.calls, "c1")
+	delete(sess.mgr.broker.calls, callKey{sess.id, "c1"})
 	sess.mgr.broker.mu.Unlock()
 	w := playbackRequest(mux, "transfer", "A", `{"to":"B"}`)
 	if w.Code != 404 || ac.bridge != bridge || bridge.terminateDisabled.Load() || ac.cm.VideoState().State != core.CallStateActive || ac.transferTarget != "" {
@@ -197,7 +197,7 @@ func TestHTTPAnnounceRejectsHumanOwner(t *testing.T) {
 	for _, action := range []string{"announce", "accept-announce"} {
 		t.Run(action, func(t *testing.T) {
 			sess, ac, mux := playbackHTTP(t)
-			if !sess.mgr.broker.setOwner("c1", "A") {
+			if !sess.mgr.broker.setOwner(sess.id, "c1", "A") {
 				t.Fatal("missing broker call")
 			}
 			w := playbackRequest(mux, action, "", `{"audioBase64":"`+base64.StdEncoding.EncodeToString(serverWAV())+`"}`)

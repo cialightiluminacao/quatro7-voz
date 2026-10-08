@@ -32,6 +32,13 @@ type CallRecord struct {
 	EndReason string     `json:"endReason,omitempty"`
 }
 
+// callKey identifies one leg. WhatsApp can reuse the same call ID in two
+// sessions hosted by this process; broker lookups must always include the session.
+type callKey struct {
+	sessionID string
+	callID    string
+}
+
 type AuthSnapshot struct {
 	State   string          `json:"state"`
 	Paired  bool            `json:"paired"`
@@ -62,8 +69,8 @@ type subscriber struct {
 type Broker struct {
 	mu      sync.RWMutex
 	subs    map[*subscriber]struct{}
-	calls   map[string]*CallRecord
-	history []CallRecord
+	calls   map[callKey]*CallRecord
+	history []CallRecord // append-only rows retain both SessionID and CallID; no ID-only index
 
 	SnapshotFn func() []any
 	// AccountForSession resolve o account_id do Chatwoot de uma sessão (0 = nenhum).
@@ -74,7 +81,7 @@ type Broker struct {
 func NewBroker() *Broker {
 	return &Broker{
 		subs:  map[*subscriber]struct{}{},
-		calls: map[string]*CallRecord{},
+		calls: map[callKey]*CallRecord{},
 	}
 }
 
@@ -213,7 +220,7 @@ func (b *Broker) emitSessionQR(sessionID, qr string) {
 func (b *Broker) upsertCall(r CallRecord) {
 	b.mu.Lock()
 	cp := r
-	b.calls[r.CallID] = &cp
+	b.calls[callKey{r.SessionID, r.CallID}] = &cp
 	b.mu.Unlock()
 	b.broadcastCallList()
 	b.broadcast(map[string]any{
@@ -222,10 +229,10 @@ func (b *Broker) upsertCall(r CallRecord) {
 	})
 }
 
-func (b *Broker) getCall(id string) (*CallRecord, bool) {
+func (b *Broker) getCall(sessionID, id string) (*CallRecord, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	c, ok := b.calls[id]
+	c, ok := b.calls[callKey{sessionID, id}]
 	if !ok {
 		return nil, false
 	}
@@ -233,10 +240,10 @@ func (b *Broker) getCall(id string) (*CallRecord, bool) {
 	return &cp, true
 }
 
-func (b *Broker) setOwner(id, owner string) bool {
+func (b *Broker) setOwner(sessionID, id, owner string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	c, ok := b.calls[id]
+	c, ok := b.calls[callKey{sessionID, id}]
 	if !ok {
 		return false
 	}
@@ -250,9 +257,9 @@ func (b *Broker) setOwner(id, owner string) bool {
 // reassignOwner troca (ou limpa, com owner=nil) o dono de uma chamada sem as travas
 // do setOwner, e re-emite call-list/call-status para os painéis refletirem. Usado na
 // transferência: liberar o dono ao ofertar e fixar o novo dono no pickup.
-func (b *Broker) reassignOwner(id string, owner *string) bool {
+func (b *Broker) reassignOwner(sessionID, id string, owner *string) bool {
 	b.mu.Lock()
-	c, ok := b.calls[id]
+	c, ok := b.calls[callKey{sessionID, id}]
 	if !ok {
 		b.mu.Unlock()
 		return false
@@ -270,9 +277,9 @@ func (b *Broker) reassignOwner(id string, owner *string) bool {
 
 // claimTransferred compares and assigns under one lock: simultaneous pickups
 // cannot steal ownership from the winner. Keep the existing status broadcasts.
-func (b *Broker) claimTransferred(id, owner string) bool {
+func (b *Broker) claimTransferred(sessionID, id, owner string) bool {
 	b.mu.Lock()
-	c, ok := b.calls[id]
+	c, ok := b.calls[callKey{sessionID, id}]
 	if !ok || (c.Owner != nil && *c.Owner != owner) {
 		b.mu.Unlock()
 		return false
@@ -288,23 +295,24 @@ func (b *Broker) claimTransferred(id, owner string) bool {
 	return true
 }
 
-func (b *Broker) ownerActiveCall(owner string) string {
+func (b *Broker) ownerActiveCall(sessionID, owner string) string {
 	if owner == "" {
 		return ""
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for id, c := range b.calls {
-		if c.Owner != nil && *c.Owner == owner && c.Status != StatusEnded {
-			return id
+	for key, c := range b.calls {
+		if key.sessionID == sessionID && c.Owner != nil && *c.Owner == owner && c.Status != StatusEnded {
+			return key.callID
 		}
 	}
 	return ""
 }
 
-func (b *Broker) endCall(id, reason string) {
+func (b *Broker) endCall(sessionID, id, reason string) {
 	b.mu.Lock()
-	c, ok := b.calls[id]
+	key := callKey{sessionID, id}
+	c, ok := b.calls[key]
 	if !ok {
 		b.mu.Unlock()
 		return
@@ -314,10 +322,9 @@ func (b *Broker) endCall(id, reason string) {
 	c.EndedAt = &now
 	c.EndReason = reason
 	ended := *c
-	delete(b.calls, id)
+	delete(b.calls, key)
 	b.history = append(b.history, ended)
 	owner := c.Owner
-	sessionID := c.SessionID
 	b.mu.Unlock()
 
 	b.broadcast(map[string]any{

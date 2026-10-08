@@ -83,7 +83,7 @@ func (s *server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ac.bridgeOpMu.Lock()
-	if record, exists := s.broker.getCall(id); exists && record.Owner != nil {
+	if record, exists := s.broker.getCall(sess.id, id); exists && record.Owner != nil {
 		err = errors.New("announce requires a call without a human owner")
 	} else {
 		err = ac.cm.Announce(r.Context(), id, wav, body.HangupAfter, time.Duration(seconds)*time.Second)

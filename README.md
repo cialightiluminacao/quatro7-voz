@@ -224,7 +224,8 @@ npm run dev      # Vite na :5173, faz proxy de /api → http://localhost:8080
 > fim da chamada, vira **nota privada** na conversa do número no Chatwoot (se
 > configurado — nunca é reenviado ao cliente) e dispara um evento `recording` no
 > webhook da sessão com `{ callId, to, url, seconds }`. O MP3 também fica em
-> `GET /recordings/{callId}.mp3` (capability). Requer `ffmpeg` (já na imagem). Base
+> `GET /recordings/{callId}.mp3` (ou `{callId}-{sessão}.mp3` na segunda ponta de uma
+> chamada entre sessões; a URL do webhook traz o nome). Requer `ffmpeg` (já na imagem). Base
 > feita a partir da contribuição de @Mercantes (PR #12).
 
 ---
