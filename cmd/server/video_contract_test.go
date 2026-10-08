@@ -167,7 +167,7 @@ func TestHTTPVideoFailureKeepsConflict(t *testing.T) {
 
 func TestVideoOrientationSnapshotRange(t *testing.T) {
 	for _, orientation := range []int{-1, 0, 1, 2, 3, 4} {
-		// O último valor válido será preenchido pelo leitor de orientação da W3.
+		// Snapshot/SSE sempre expõem orientação no intervalo 0..3.
 		sess, ac := ringingTimeoutSession()
 		c := ac.cm.CurrentCall()
 		c.StateData.PeerOrientation = orientation
@@ -180,6 +180,36 @@ func TestVideoOrientationSnapshotRange(t *testing.T) {
 			t.Fatalf("orientation=%d snapshot=%v", orientation, got)
 		}
 		ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+	}
+}
+
+func TestOrientationStanzaEmitsSSEAndRetainsSnapshot(t *testing.T) {
+	sess, ac := ringingTimeoutSession()
+	sess.id = "s1"
+	c := ac.cm.CurrentCall()
+	c.StateData.State = core.CallStateActive
+	sess.wireCall(ac.cm, "c1")
+	defer ac.cm.EndCall(context.Background(), core.EndCallReasonUserEnded)
+	sub := sess.mgr.broker.subscribe("test", 0)
+	drain(sub)
+	for _, orientation := range []string{"1", "2", "3", "0"} {
+		node := &waBinary.Node{Tag: "call", Content: []waBinary.Node{{
+			Tag: "video", Attrs: waBinary.Attrs{"call-id": "c1", "device_orientation": orientation},
+		}}}
+		ac.cm.HandleVideoState(context.Background(), node)
+		events := drain(sub)
+		if len(events) != 1 {
+			t.Fatalf("eventos=%v", events)
+		}
+		event := events[0]
+		snapshot := ac.cm.VideoState()
+		if event["type"] != "video-state" || event["motivo"] != "peer-orientation" || snapshot.VideoMotivo != "peer-orientation" || event["peerOrientation"] != float64(snapshot.PeerOrientation) || event["sessionId"] != "s1" || event["id"] != "c1" {
+			t.Fatalf("SSE=%v snapshot=%+v", event, snapshot)
+		}
+		ac.cm.HandleVideoState(context.Background(), node)
+		if events := drain(sub); len(events) != 0 {
+			t.Fatalf("orientação repetida gerou evento: %v", events)
+		}
 	}
 }
 

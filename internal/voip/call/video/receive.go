@@ -1,0 +1,256 @@
+package video
+
+import (
+	"time"
+	"wacalls/internal/voip/media"
+	"wacalls/internal/voip/transport"
+)
+
+const maxReceiveAUBytes = 4 << 20
+
+// MediaFrameInfo usa one-byte headers, apesar do profile específico 0xDEBE.
+// Portado de AstraCalls 69e1ef8 pipeline.go:55-78; valida também o restante do
+// bloco, para não aceitar orientação de uma extensão truncada/malformada.
+func parseVideoOrientation(h *media.RtpHeader) (int, bool) {
+	if h == nil || !h.Extension || h.ExtensionProfile != videoExtProfile || len(h.ExtensionData)%4 != 0 {
+		return 0, false
+	}
+	ext := h.ExtensionData
+	orientation, found := 0, false
+	for off := 0; off < len(ext); {
+		hdr := ext[off]
+		off++
+		if hdr == 0 {
+			continue
+		}
+		id, size := hdr>>4, int(hdr&0x0f)+1
+		if id == 0 || id == 15 || off+size > len(ext) {
+			return 0, false
+		}
+		if id == 3 {
+			if found {
+				return 0, false
+			}
+			// Campos adicionais do MediaFrameInfo não alteram os 2 bits de CVO.
+			orientation, found = int(ext[off]&3), true
+		}
+		off += size
+	}
+	return orientation, found
+}
+
+type receiveState struct {
+	ssrc           uint32
+	seqKnown       bool
+	lastSeq        uint16
+	timestamp      uint32
+	haveTimestamp  bool
+	active         bool
+	damaged        bool
+	needIDR        bool
+	idrWaitAt      time.Time
+	latePackets    int
+	fuActive       bool
+	fuHeader       byte
+	orientation    int
+	hasOrientation bool
+	auSequence     uint32
+	auBytes        int
+}
+
+func (p *Pipeline) discardReceiveAULocked() {
+	p.frameBuf = nil
+	p.depack = &transport.H264Depacketizer{}
+	p.receive.damaged = true
+	p.requireReceiveIDRLocked()
+	p.receive.fuActive = false
+}
+
+// Requer mu: SRTP, sequência e remontagem ficam serializados entre os relays.
+func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
+	r, h := &p.receive, pkt.Header
+	if r.seqKnown && r.ssrc != h.Ssrc {
+		// Outro stream não pode completar o FU-A do anterior.
+		*r = receiveState{auSequence: r.auSequence, needIDR: true, idrWaitAt: p.now()}
+		p.receiveSPS, p.receivePPS = nil, nil
+		p.frameBuf = nil
+		p.depack = &transport.H264Depacketizer{}
+	}
+	if r.seqKnown {
+		distance := int16(h.SequenceNumber - r.lastSeq)
+		if distance <= 0 {
+			r.latePackets++
+			if r.latePackets < 8 {
+				return nil, false
+			}
+			p.discardReceiveAULocked()
+			r.haveTimestamp, r.active = false, false
+		} else {
+			r.latePackets = 0
+		}
+		if distance != 1 {
+			p.requireReceiveIDRLocked()
+			if r.active && h.Timestamp == r.timestamp {
+				p.discardReceiveAULocked()
+			}
+		}
+	}
+	r.ssrc, r.lastSeq, r.seqKnown = h.Ssrc, h.SequenceNumber, true
+	if !r.haveTimestamp || h.Timestamp != r.timestamp {
+		if r.active {
+			p.discardReceiveAULocked() // marker/fim do FU-A perdido
+		}
+		p.frameBuf = nil
+		p.depack = &transport.H264Depacketizer{}
+		r.timestamp, r.haveTimestamp, r.active = h.Timestamp, true, true
+		r.damaged, r.fuActive = false, false
+		r.auBytes = 0
+		r.orientation, r.hasOrientation = p.peerOrientation, false
+		r.auSequence++
+	} else if !r.active {
+		return nil, false // pacote depois do marker da mesma AU
+	}
+	if orientation, ok := parseVideoOrientation(h); ok && !r.hasOrientation {
+		r.orientation, r.hasOrientation = orientation, true
+	}
+	if !r.damaged {
+		r.auBytes += len(pkt.Payload)
+		if r.auBytes > maxReceiveAUBytes || !r.validPayload(pkt.Payload) {
+			p.discardReceiveAULocked()
+		} else {
+			for _, nalu := range p.depack.Depacketize(pkt.Payload) {
+				if len(p.frameBuf)+len(nalu)+4 > maxReceiveAUBytes {
+					p.discardReceiveAULocked()
+					break
+				}
+				p.frameBuf = append(p.frameBuf, annexBStartCode...)
+				p.frameBuf = append(p.frameBuf, nalu...)
+			}
+		}
+	}
+	if !h.Marker {
+		return nil, false
+	}
+	if r.fuActive {
+		p.discardReceiveAULocked() // marker com FU-A ainda incompleto
+	}
+	r.active = false
+	changed := false
+	if r.hasOrientation {
+		changed = p.peerOrientation != r.orientation
+		p.peerOrientation, p.rtpOrientationKnown = r.orientation, true
+	}
+	au := p.frameBuf
+	p.frameBuf = nil
+	if r.damaged || len(au) == 0 {
+		return nil, changed
+	}
+	// WhatsApp pode fragmentar vários NALUs Annex-B como um único FU-A.
+	nalus := transport.SplitAnnexB(au)
+	idr := hasIDR(nalus)
+	haveSPS, havePPS := false, false
+	for _, n := range nalus {
+		if len(n) == 0 {
+			continue
+		}
+		switch n[0] & 31 {
+		case 7:
+			p.receiveSPS = append([]byte(nil), n...)
+			haveSPS = true
+		case 8:
+			p.receivePPS = append([]byte(nil), n...)
+			havePPS = true
+		}
+	}
+	if r.needIDR && r.idrWaitAt.IsZero() {
+		r.idrWaitAt = p.now()
+	}
+	if r.needIDR && idr {
+		var prefix []byte
+		if !haveSPS && len(p.receiveSPS) > 0 {
+			prefix = append(prefix, annexBStartCode...)
+			prefix = append(prefix, p.receiveSPS...)
+		}
+		if !havePPS && len(p.receivePPS) > 0 {
+			prefix = append(prefix, annexBStartCode...)
+			prefix = append(prefix, p.receivePPS...)
+		}
+		au = append(prefix, au...)
+	}
+	if r.needIDR && !idr {
+		if p.now().Sub(r.idrWaitAt) < 2*time.Second {
+			return nil, changed
+		}
+		p.log.Info("video receive IDR wait expired", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
+		r.needIDR = false
+		r.idrWaitAt = time.Time{}
+	}
+	if idr {
+		if r.needIDR {
+			p.log.Info("video receive IDR recovered", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
+		}
+		r.needIDR = false
+		r.idrWaitAt = time.Time{}
+	}
+	if p.envelopeCapable {
+		au = envelopeAU(au, r.orientation, idr, r.auSequence, h.Timestamp)
+	}
+	return au, changed
+}
+
+// Detecta continuação órfã, início/fim perdido, troca de NAL e STAP-A truncado.
+func (r *receiveState) validPayload(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	switch kind := payload[0] & 0x1f; {
+	case kind >= 1 && kind <= 23:
+		return !r.fuActive
+	case kind == 24:
+		if r.fuActive || len(payload) < 4 {
+			return false
+		}
+		for body := payload[1:]; len(body) > 0; {
+			if len(body) < 2 {
+				return false
+			}
+			size := int(body[0])<<8 | int(body[1])
+			body = body[2:]
+			if size == 0 || size > len(body) {
+				return false
+			}
+			body = body[size:]
+		}
+		return true
+	case kind == 28:
+		if len(payload) < 3 {
+			return false
+		}
+		start, end, typ := payload[1]&0x80 != 0, payload[1]&0x40 != 0, payload[1]&0x1f
+		if payload[1]&0x20 != 0 || (start && end) || typ == 0 || typ > 23 {
+			return false
+		}
+		header := payload[0]&0xe0 | typ
+		if start {
+			if r.fuActive {
+				return false
+			}
+			r.fuActive, r.fuHeader = true, header
+		} else if !r.fuActive || r.fuHeader != header {
+			return false
+		}
+		if end {
+			r.fuActive = false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Pipeline) requireReceiveIDRLocked() {
+	if !p.receive.needIDR || p.receive.idrWaitAt.IsZero() {
+		p.receive.idrWaitAt = p.now()
+	}
+	p.receive.needIDR = true
+}

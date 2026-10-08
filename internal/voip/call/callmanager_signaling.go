@@ -54,6 +54,7 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 		}
 	}
 	m.currentCall = call
+	m.video.BeginCall(callID)
 	m.initialTransportSent = false
 
 	selfJid := m.sock.OwnLID()

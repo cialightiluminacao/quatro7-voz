@@ -61,6 +61,24 @@ func (m *CallManager) notePeerVideoActive() {
 	m.log.Info("peer video ativo (frames recebidos)", "call_id", c.CallID)
 }
 
+func (m *CallManager) notePeerVideoOrientation(callID string, orientation int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.currentCall
+	if c == nil || c.IsEnded() || c.CallID != callID {
+		return
+	}
+	m.notePeerVideoOrientationLocked(orientation)
+}
+
+func (m *CallManager) notePeerVideoOrientationLocked(orientation int) {
+	if orientation < 0 || orientation > 3 || m.currentCall.StateData.PeerOrientation == orientation {
+		return
+	}
+	m.currentCall.StateData.PeerOrientation = orientation
+	m.emitVideoStateLocked("peer-orientation")
+}
+
 // HandleVideoState confirma a stanza e aplica apenas a negociação ainda vigente.
 func (m *CallManager) HandleVideoState(ctx context.Context, node *waBinary.Node) {
 	info := signaling.ExtractNodeInfo(node)
@@ -78,7 +96,15 @@ func (m *CallManager) HandleVideoState(ctx context.Context, node *waBinary.Node)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !videoCallActive(c) || c != m.currentCall || c.CallID != info.CallID {
+	if c == nil || c.IsEnded() || c != m.currentCall || c.CallID != info.CallID {
+		return
+	}
+	// Orientação é independente do state/epoch da negociação: a stanza pode
+	// conter só device_orientation. CVO RTP já conhecido tem precedência.
+	if orientation := wanode.AttrInt(info.InnerNode.Attrs, "device_orientation", -1); orientation >= 0 && orientation <= 3 {
+		m.notePeerVideoOrientationLocked(m.video.SetOrientationFallback(orientation))
+	}
+	if !videoCallActive(c) {
 		return
 	}
 	if epoch != m.videoEpoch && (state == signaling.VideoStateUpgradeAccept || state == signaling.VideoStateUpgradeReject) {

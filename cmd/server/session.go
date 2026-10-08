@@ -454,11 +454,16 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 	}
 	cm.OnPeerVideo = func(au []byte) {
-		ac, ok := s.reg.get(callID)
-		if !ok || ac.bridge == nil {
+		bridge, _, ok := s.reg.mediaOf(callID)
+		if !ok || bridge == nil {
 			return
 		}
-		_ = ac.bridge.WriteVideo(au)
+		_ = bridge.WriteVideo(au)
+	}
+	cm.OnVideoKeyframeRequest = func() {
+		if bridge, _, ok := s.reg.mediaOf(callID); ok && bridge != nil {
+			_ = bridge.RequestVideoKeyframe()
+		}
 	}
 	cm.OnVideoUpgradeRequest = func(c *call.CallInfo) {
 		s.mgr.broker.emitVideoState(s.id, c.CallID, "upgrade-request", c.StateData)
@@ -969,6 +974,9 @@ func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
 	// oldB.DisableTerminate() antes do Close impede que fechar a ponte antiga encerre a chamada.
 	ac.mediaMu.Lock()
 	defer ac.mediaMu.Unlock()
+	if ac.cm != nil {
+		ac.cm.ResetVideoEnvelope()
+	}
 	oldB, oldOC, found := s.reg.setBridge(callID, b, oc)
 	if !found {
 		b.Close()
@@ -1066,6 +1074,9 @@ func (s *Session) setWSBridge(callID string, b *wsBridge, oc media.Codec) {
 		return
 	}
 	ac.mediaMu.Lock()
+	if ac.cm != nil {
+		ac.cm.ResetVideoEnvelope()
+	}
 	oldWSB, oldB, oldOC, found := s.reg.setWSBridge(callID, b, oc)
 	if !found {
 		ac.mediaMu.Unlock()

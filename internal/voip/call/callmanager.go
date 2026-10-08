@@ -73,12 +73,13 @@ type CallManager struct {
 	audioReorderTimer *time.Timer
 	audioReceiveEpoch uint64
 
-	OnStateChange    func(*CallInfo)
-	OnIncoming       func(*CallInfo)
-	OnEnded          func(*CallInfo)
-	OnPeerAudio      func([]float32)
-	OnPeerAudioReset func() // retomada: descarta PCM antigo no playout
-	OnPeerVideo      func([]byte)
+	OnStateChange          func(*CallInfo)
+	OnIncoming             func(*CallInfo)
+	OnEnded                func(*CallInfo)
+	OnPeerAudio            func([]float32)
+	OnPeerAudioReset       func() // retomada: descarta PCM antigo no playout
+	OnPeerVideo            func([]byte)
+	OnVideoKeyframeRequest func() // enviar texto KF ao browser; rate limit no pipeline
 
 	OnVideoUpgradeRequest func(*CallInfo) // o peer pediu um upgrade p/ vídeo
 	OnVideoStateChanged   func(*CallInfo) // qualquer mudança no estado de vídeo
@@ -98,6 +99,12 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 	relay.SetOnReceive(func(data []byte) { m.onRelayData(data) })
 	m.relay = relay
 	m.video = callvideo.New(log, relay)
+	m.video.OnOrientation = m.notePeerVideoOrientation
+	m.video.OnKeyframeRequired = func() {
+		if m.OnVideoKeyframeRequest != nil {
+			m.OnVideoKeyframeRequest()
+		}
+	}
 	m.video.OnFrame = func(au []byte) {
 		m.notePeerVideoActive()
 		if m.OnPeerVideo != nil {
@@ -185,6 +192,7 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 	callKey := media.GenerateCallKey()
 	call.EncryptionKey = callKey
 	m.currentCall = call
+	m.video.BeginCall(callID)
 	m.initialTransportSent = false
 	m.outgoingPreacceptSent = false
 

@@ -1,6 +1,7 @@
 package video
 
 import (
+	"encoding/binary"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,8 +12,8 @@ import (
 )
 
 const (
-	rtpStepSamples      = 90000 / 15
-	congestionDropBytes = 48 * 1024
+	// Duas IDRs de até 128 KiB. Verificado antes da AU; nunca corta seus fragmentos.
+	congestionDropBytes = 256 << 10
 	slotWord            = 2
 )
 
@@ -32,13 +33,26 @@ type Pipeline struct {
 	log   *slog.Logger
 	relay Relay
 
-	mu       sync.Mutex
-	rtp      *media.RtpSession
-	srtp     *media.SrtpSession
-	selfSsrc uint32
-	depack   *transport.H264Depacketizer
-	frameBuf []byte
-	lastAUAt time.Time
+	sendMu     sync.Mutex // serializa packetização e SRTP de envio fora de mu
+	mu         sync.Mutex
+	receiveMu  sync.Mutex // serializa recepção e callbacks; nunca adquirido sob mu
+	rtp        *media.RtpSession
+	srtp       *media.SrtpSession
+	selfSsrc   uint32
+	depack     *transport.H264Depacketizer
+	frameBuf   []byte
+	firstAUAt  time.Time
+	clockTicks uint32
+	now        func() time.Time
+	lastKFAt   time.Time
+	idrWaitAt  time.Time
+
+	callID                 string
+	envelopeCapable        bool
+	peerOrientation        int
+	rtpOrientationKnown    bool
+	receive                receiveState
+	receiveSPS, receivePPS []byte
 
 	// Estado da extensão de vídeo do WhatsApp (perfil 0xDEBE) no envio.
 	frameNumber      uint16 // nº do frame (por access unit), começa em 1
@@ -46,13 +60,16 @@ type Pipeline struct {
 	keyframeRequired bool   // o primeiro frame enviado precisa ser IDR
 
 	OnFrame func(au []byte)
+	// Callbacks rodam sem mu; Setup/Reset podem ser chamados com o lock da call.
+	OnOrientation      func(callID string, orientation int)
+	OnKeyframeRequired func()
 }
 
 func New(log *slog.Logger, relay Relay) *Pipeline {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Pipeline{log: log, relay: relay}
+	return &Pipeline{log: log, relay: relay, now: time.Now}
 }
 
 func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, recvKM core.SrtpKeyingMaterial) error {
@@ -70,16 +87,21 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 	}
 
 	p.mu.Lock()
+	if p.callID != callID {
+		p.resetLocked()
+		p.callID = callID
+	}
 	p.srtp = srtp
 	p.selfSsrc = selfSsrc
 	p.rtp = media.NewH264Session(selfSsrc)
-	if p.depack == nil {
-		p.depack = &transport.H264Depacketizer{}
-	}
+	p.depack = &transport.H264Depacketizer{}
+	p.receive = receiveState{auSequence: p.receive.auSequence, needIDR: p.receive.seqKnown || p.receive.needIDR, idrWaitAt: p.receive.idrWaitAt}
+	p.frameBuf = nil
 	p.frameNumber = 1
 	p.transportSeq = 0
 	p.keyframeRequired = true
-	p.lastAUAt = time.Time{}
+	p.firstAUAt = time.Time{}
+	p.clockTicks = 0
 	p.mu.Unlock()
 
 	p.relay.SetStreamSsrcs(selfSsrcs, peerSsrcs)
@@ -108,9 +130,9 @@ func buildWhatsappVideoExt(mediaFrameInfo uint8, frameNumber *uint16, transportS
 	} else {
 		ext = append(ext, 0x30, mediaFrameInfo) // id3, len1
 	}
-	ext = append(ext, 0x51, 0x00, 0x00)                                     // id5 InitialBandwidth=0
-	ext = append(ext, 0x61, 0x00, 0x00)                                     // id6 ShortOffset=0
-	ext = append(ext, 0x91, byte(transportSeq>>8), byte(transportSeq))      // id9 TransportSequence
+	ext = append(ext, 0x51, 0x00, 0x00)                                // id5 InitialBandwidth=0
+	ext = append(ext, 0x61, 0x00, 0x00)                                // id6 ShortOffset=0
+	ext = append(ext, 0x91, byte(transportSeq>>8), byte(transportSeq)) // id9 TransportSequence
 	for len(ext)%4 != 0 {
 		ext = append(ext, 0x00) // padding até fronteira de 4 bytes
 	}
@@ -118,13 +140,22 @@ func buildWhatsappVideoExt(mediaFrameInfo uint8, frameNumber *uint16, transportS
 }
 
 func (p *Pipeline) FeedCaptured(au []byte) {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
 	p.mu.Lock()
+	locked := true
+	var requestKeyframe func()
+	defer func() {
+		if locked {
+			p.mu.Unlock()
+		}
+		if requestKeyframe != nil {
+			requestKeyframe()
+		}
+	}()
 	rtp, srtp := p.rtp, p.srtp
-	keyframeRequired := p.keyframeRequired
 	frameNum := p.frameNumber
 	tseq := p.transportSeq
-	first := p.lastAUAt.IsZero()
-	p.mu.Unlock()
 	if rtp == nil || srtp == nil || !p.relay.HasConnection() || len(au) == 0 {
 		return
 	}
@@ -132,16 +163,33 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	if len(nalus) == 0 {
 		return
 	}
-	idr := false
-	for _, n := range nalus {
-		if len(n) > 0 && n[0]&0x1f == 5 { // NAL tipo 5 = IDR
-			idr = true
-			break
+	idr := hasIDR(nalus)
+	now := p.now()
+	// Após um drop, repete KF enquanto espera IDR, no máximo uma vez por segundo.
+	if p.relay.BufferedAmount() > congestionDropBytes {
+		if p.envelopeCapable {
+			if !p.keyframeRequired || p.idrWaitAt.IsZero() {
+				p.idrWaitAt = now
+			}
+			p.keyframeRequired = true
+			requestKeyframe = p.requestKeyframeLocked(now)
 		}
-	}
-	// O primeiro frame enviado precisa ser keyframe, senão o peer não decodifica.
-	if keyframeRequired && !idr {
 		return
+	}
+	// Aguarda o IDR inicial ou a recuperação Q1, com teto de dois segundos.
+	if p.keyframeRequired && !idr {
+		if p.idrWaitAt.IsZero() {
+			p.idrWaitAt = now
+		}
+		if now.Sub(p.idrWaitAt) < 2*time.Second {
+			if p.envelopeCapable {
+				requestKeyframe = p.requestKeyframeLocked(now)
+			}
+			return
+		}
+		p.log.Info("video outbound IDR wait expired", "idr_wait_ms", now.Sub(p.idrWaitAt).Milliseconds())
+		p.keyframeRequired = false
+		p.idrWaitAt = time.Time{}
 	}
 	// Junta TODOS os NALUs (menos AUD tipo 9) num único access unit Annex-B e fragmenta
 	// como UM NAL — é assim que o WhatsApp manda o vídeo (não NALU a NALU).
@@ -158,17 +206,24 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	if len(packed) == 0 {
 		return
 	}
-	if p.relay.BufferedAmount() > congestionDropBytes {
-		return
-	}
-	if !first {
-		rtp.AdvanceTimestamp(rtpStepSamples)
+	if p.firstAUAt.IsZero() {
+		p.firstAUAt = now
+	} else {
+		// Âncora na primeira AU enviada: inclui pausas/drops e não acumula erros
+		// de arredondamento. time.Now.Sub usa o relógio monotônico quando disponível.
+		elapsed := now.Sub(p.firstAUAt)
+		if elapsed > 0 {
+			ticks := uint32(elapsed/time.Second)*90000 + uint32(elapsed%time.Second*90000/time.Second)
+			rtp.AdvanceTimestamp(ticks - p.clockTicks)
+			p.clockTicks = ticks
+		}
 	}
 	mediaFrameInfo := uint8(videoMediaFrameDelta)
 	if idr {
 		mediaFrameInfo = videoMediaFrameIDR
 	}
 	payloads := transport.PackageH264NALU(packed)
+	packets := make([]*media.RtpPacket, 0, len(payloads))
 	for i, payload := range payloads {
 		last := i == len(payloads)-1
 		var fn *uint16
@@ -181,55 +236,69 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 		pkt.Header.ExtensionProfile = videoExtProfile
 		pkt.Header.ExtensionData = buildWhatsappVideoExt(mediaFrameInfo, fn, tseq)
 		tseq++
-		if protected, err := srtp.Protect(pkt); err == nil {
-			p.relay.Broadcast(protected)
-		}
+		packets = append(packets, pkt)
 	}
 
-	p.mu.Lock()
-	p.lastAUAt = time.Now()
 	p.transportSeq = tseq
 	p.frameNumber = frameNum + 1
 	if idr {
 		p.keyframeRequired = false
+		p.idrWaitAt = time.Time{}
 	}
+	relay := p.relay
 	p.mu.Unlock()
+	locked = false
+	for _, pkt := range packets {
+		if protected, err := srtp.Protect(pkt); err == nil {
+			relay.Broadcast(protected)
+		}
+	}
+}
+
+func (p *Pipeline) requestKeyframeLocked(now time.Time) func() {
+	if p.OnKeyframeRequired == nil || (!p.lastKFAt.IsZero() && now.Sub(p.lastKFAt) < time.Second) {
+		return nil
+	}
+	p.lastKFAt = now
+	return p.OnKeyframeRequired
+}
+
+func hasIDR(nalus [][]byte) bool {
+	for _, n := range nalus {
+		if len(n) > 0 && n[0]&0x1f == 5 {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pipeline) HandleRelayData(data []byte) {
+	p.receiveMu.Lock()
+	defer p.receiveMu.Unlock()
 	p.mu.Lock()
-	srtp, depack, selfSsrc := p.srtp, p.depack, p.selfSsrc
-	p.mu.Unlock()
-	if srtp == nil || depack == nil {
+	if p.srtp == nil || p.depack == nil || len(data) < 12 {
+		p.mu.Unlock()
 		return
 	}
-	if media.RTPSsrc(data) == selfSsrc {
+	if media.RTPSsrc(data) == p.selfSsrc {
+		p.mu.Unlock()
 		return
 	}
 
-	pkt, err := srtp.Unprotect(data)
+	pkt, err := p.srtp.Unprotect(data)
 	if err != nil {
+		p.mu.Unlock()
 		p.log.Debug("video srtp unprotect error", "err", err)
 		return
 	}
-	if len(pkt.Payload) == 0 {
-		return
-	}
-	nalus := depack.Depacketize(pkt.Payload)
-
-	p.mu.Lock()
-	for _, nalu := range nalus {
-		p.frameBuf = append(p.frameBuf, annexBStartCode...)
-		p.frameBuf = append(p.frameBuf, nalu...)
-	}
-	var frame []byte
-	if pkt.Header.Marker && len(p.frameBuf) > 0 {
-		frame = p.frameBuf
-		p.frameBuf = nil
-	}
+	frame, orientationChanged := p.receivePacketLocked(pkt)
 	cb := p.OnFrame
+	orientationCB, callID, orientation := p.OnOrientation, p.callID, p.peerOrientation
 	p.mu.Unlock()
 
+	if orientationChanged && orientationCB != nil {
+		orientationCB(callID, orientation)
+	}
 	if frame != nil && cb != nil {
 		cb(frame)
 	}
@@ -237,14 +306,83 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 
 func (p *Pipeline) Reset() {
 	p.mu.Lock()
+	p.resetLocked()
+	p.mu.Unlock()
+}
+
+func (p *Pipeline) resetLocked() {
 	p.rtp = nil
 	p.srtp = nil
 	p.selfSsrc = 0
 	p.depack = nil
 	p.frameBuf = nil
-	p.lastAUAt = time.Time{}
+	p.firstAUAt = time.Time{}
+	p.clockTicks = 0
+	p.lastKFAt = time.Time{}
+	p.idrWaitAt = time.Time{}
 	p.frameNumber = 1
 	p.transportSeq = 0
 	p.keyframeRequired = true
+	p.callID = ""
+	p.envelopeCapable = false
+	p.peerOrientation = 0
+	p.rtpOrientationKnown = false
+	p.receive = receiveState{}
+	p.receiveSPS, p.receivePPS = nil, nil
+}
+
+// BeginCall limpa metadados antes de Setup (Q1/stanza podem chegar antes das chaves).
+func (p *Pipeline) BeginCall(callID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.callID != callID {
+		p.resetLocked()
+		p.callID = callID
+	}
+}
+
+// EnableEnvelope é idempotente e vale até o fim da chamada, inclusive após rekey.
+func (p *Pipeline) EnableEnvelope() {
+	p.mu.Lock()
+	p.envelopeCapable = true
 	p.mu.Unlock()
+}
+
+// SetOrientationFallback aplica a stanza até existir CVO RTP válido na chamada.
+// Depois disso, ausência de extensão preserva o último CVO, sem regressar à stanza.
+// Não chama OnOrientation: o chamador já detém o lock da call e emite o snapshot.
+func (p *Pipeline) SetOrientationFallback(orientation int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if orientation >= 0 && orientation <= 3 && !p.rtpOrientationKnown {
+		p.peerOrientation = orientation
+	}
+	return p.peerOrientation
+}
+
+// Q1, negociado por texto no DataChannel h264, habilita este envelope binário:
+// [0]=0x51, [1]=0x01, [2]=orientação, [3]=flags (bit0=IDR, demais=0),
+// [4:8]=sequência da AU uint32 BE (começa em 1, inclui AUs descartadas),
+// [8:12]=timestamp RTP uint32 BE, [12:]=AU Annex-B intacta.
+// Renderer: para exibir em pé, rotacionar NO SENTIDO HORÁRIO em torno do centro:
+// 0 -> 0°, 1 -> 90°, 2 -> 180°, 3 -> 270°. Trocar largura/altura em 1 e 3.
+// Derivado de AstraCalls 69e1ef8, pipeline.go:50-78 (CVO = quartos de volta horários).
+// Sem Q1, enviar os bytes Annex-B originais, sem prefixo.
+func envelopeAU(au []byte, orientation int, idr bool, sequence, timestamp uint32) []byte {
+	out := make([]byte, 12+len(au))
+	out[0], out[1], out[2] = 0x51, 0x01, byte(orientation)
+	if idr {
+		out[3] = 1
+	}
+	binary.BigEndian.PutUint32(out[4:8], sequence)
+	binary.BigEndian.PutUint32(out[8:12], timestamp)
+	copy(out[12:], au)
+	return out
+}
+
+func (p *Pipeline) DisableEnvelope() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.envelopeCapable = false
+	p.idrWaitAt = time.Time{}
 }

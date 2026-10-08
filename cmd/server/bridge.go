@@ -87,10 +87,12 @@ type Bridge struct {
 	localTrack *webrtc.TrackLocalStaticSample
 	videoDC    atomic.Pointer[webrtc.DataChannel]
 	log        *slog.Logger
+	callID     string
 
 	OnBrowserRTP func(payload []byte)
 	// OnBrowserVideo is invoked with H264 access units captured from the browser camera.
-	OnBrowserVideo func(au []byte)
+	OnBrowserVideo  func(au []byte)
+	OnVideoEnvelope func(callID string) // texto Q1: a call passa a receber envelope versão 1
 	// OnTerminalICE fires when the peer connection fails or closes.
 	OnTerminalICE func()
 	// terminateDisabled silencia o OnTerminalICE. Usado ao TROCAR a ponte (ex.:
@@ -103,7 +105,11 @@ type Bridge struct {
 func (b *Bridge) DisableTerminate() { b.terminateDisabled.Store(true) }
 
 func NewBridge(offerSDP string, log *slog.Logger) (*Bridge, string, error) {
-	pc, err := getBrowserAPI(log).NewPeerConnection(webrtc.Configuration{})
+	return newBridgeWithAPI(offerSDP, log, getBrowserAPI(log))
+}
+
+func newBridgeWithAPI(offerSDP string, log *slog.Logger, api *webrtc.API) (*Bridge, string, error) {
+	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return nil, "", err
 	}
@@ -147,11 +153,7 @@ func NewBridge(offerSDP string, log *slog.Logger) (*Bridge, string, error) {
 			return
 		}
 		br.videoDC.Store(dc)
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if cb := br.OnBrowserVideo; cb != nil && len(msg.Data) > 0 {
-				cb(msg.Data)
-			}
-		})
+		dc.OnMessage(br.handleVideoMessage)
 	})
 
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
@@ -184,6 +186,25 @@ func NewBridge(offerSDP string, log *slog.Logger) (*Bridge, string, error) {
 	<-gatherComplete
 
 	return br, pc.LocalDescription().SDP, nil
+}
+
+func (b *Bridge) handleVideoMessage(msg webrtc.DataChannelMessage) {
+	if msg.IsString {
+		if string(msg.Data) == "Q1" && b.OnVideoEnvelope != nil {
+			b.OnVideoEnvelope(b.callID)
+		}
+		return
+	}
+	if b.OnBrowserVideo != nil && len(msg.Data) > 0 {
+		b.OnBrowserVideo(msg.Data)
+	}
+}
+
+func (b *Bridge) RequestVideoKeyframe() error {
+	if dc := b.videoDC.Load(); dc != nil {
+		return dc.SendText("KF")
+	}
+	return nil
 }
 
 func (b *Bridge) WriteOpus(payload []byte, dur time.Duration) error {

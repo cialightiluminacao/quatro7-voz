@@ -655,6 +655,15 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 	bridge.OnBrowserVideo = func(au []byte) {
 		ac.cm.FeedCapturedVideo(au)
 	}
+	bridge.callID = callID
+	bridge.OnVideoEnvelope = func(negotiatedCallID string) {
+		ac.mediaMu.Lock()
+		defer ac.mediaMu.Unlock()
+		current, _, ok := sess.reg.mediaOf(negotiatedCallID)
+		if ok && current == bridge {
+			ac.cm.EnableVideoEnvelope(negotiatedCallID)
+		}
+	}
 	bridge.OnTerminalICE = func() {
 		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
 	}
