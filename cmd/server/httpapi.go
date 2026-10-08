@@ -657,10 +657,12 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 	}
 	bridge.callID = callID
 	bridge.OnVideoEnvelope = func(negotiatedCallID string) {
+		// Nunca chamar cm (mu) sob mediaMu (callregistry.go): confere a ponte, solta e só então habilita.
 		ac.mediaMu.Lock()
-		defer ac.mediaMu.Unlock()
 		current, _, ok := sess.reg.mediaOf(negotiatedCallID)
-		if ok && current == bridge {
+		match := ok && current == bridge
+		ac.mediaMu.Unlock()
+		if match {
 			ac.cm.EnableVideoEnvelope(negotiatedCallID)
 		}
 	}
