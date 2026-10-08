@@ -127,8 +127,9 @@ func TestStartCallPersistsCalleeDevices(t *testing.T) {
 func TestCompanionAcceptStopsSiblingDevices(t *testing.T) {
 	primary := lidDevice("62440234549366", 0)
 	companion := lidDevice("62440234549366", 33)
-	sock := &deviceSock{devices: []types.JID{primary, companion}}
-	m := ringingManager(sock, []types.JID{primary, companion})
+	other := lidDevice("62440234549366", 44)
+	sock := &deviceSock{devices: []types.JID{primary, companion, other}}
+	m := ringingManager(sock, sock.devices)
 
 	m.HandleCallAccept(context.Background(), acceptNode("CALL1", companion), companion)
 
@@ -136,8 +137,51 @@ func TestCompanionAcceptStopsSiblingDevices(t *testing.T) {
 	if !ok {
 		t.Fatalf("nenhum terminate accepted_elsewhere enviado; tags=%v", sock.sentTags())
 	}
-	if len(dests) != 1 || dests[0] != primary.String() {
-		t.Fatalf("destination deve listar só o primary %s, veio %v", primary, dests)
+	if len(dests) != 2 || dests[0] != primary.String() || dests[1] != other.String() {
+		t.Fatalf("destination deve excluir o companion que atendeu %s, veio %v", companion, dests)
+	}
+}
+
+func TestAmbiguousAcceptDoesNotTerminateAnyCalleeDevice(t *testing.T) {
+	primary := lidDevice("62440234549366", 0)
+	companion := lidDevice("62440234549366", 33)
+	other := lidDevice("62440234549366", 44)
+	cases := []struct {
+		name    string
+		from    types.JID
+		devices []types.JID
+	}{
+		{"bare with primary in offer", primary, []types.JID{primary, companion, other}},
+		{"bare with only companions in offer", primary, []types.JID{companion, other}},
+		{"device missing from offer", lidDevice(primary.User, 55), []types.JID{primary, companion, other}},
+		{"PN device with LID offer", wanode.MustJID("554796178253:33@s.whatsapp.net"), []types.JID{primary, companion}},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			sock := &deviceSock{devices: tt.devices}
+			m := ringingManager(sock, sock.devices)
+			m.HandleCallAccept(context.Background(), acceptNode("CALL1", tt.from), tt.from)
+			if dests, ok := elsewhereDests(sock.sent); ok {
+				t.Fatalf("accept ambíguo mandou accepted_elsewhere para %v", dests)
+			}
+			if m.currentCall.StateData.State != core.CallStateConnecting || m.acceptedByJid != tt.from.String() {
+				t.Fatalf("accept deve avançar a chamada: state=%s accepted_by=%s", m.currentCall.StateData.State, m.acceptedByJid)
+			}
+			if len(sock.sent) != 2 || wanode.NodeChildren(&sock.sent[0])[0].Tag != "transport" ||
+				wanode.NodeChildren(&sock.sent[1])[0].Tag != "mute_v2" {
+				t.Fatalf("accept deve continuar enviando transport/mute_v2, veio %v", sock.sent)
+			}
+		})
+	}
+}
+
+func TestAcceptForDifferentCallDoesNotChangeCurrentCall(t *testing.T) {
+	companion := lidDevice("62440234549366", 33)
+	sock := &deviceSock{}
+	m := ringingManager(sock, []types.JID{companion})
+	m.HandleCallAccept(context.Background(), acceptNode("OTHER", companion), companion)
+	if m.acceptedByJid != "" || m.currentCall.StateData.State != core.CallStateRinging || len(sock.sent) != 0 {
+		t.Fatal("accept de outro call-id alterou a chamada atual")
 	}
 }
 
@@ -171,6 +215,44 @@ func TestSecondAcceptFromAnotherDeviceIsIgnored(t *testing.T) {
 	}
 	if after := len(sock.sent); after != before {
 		t.Fatalf("accept duplicado não deve enviar stanzas: %d -> %d", before, after)
+	}
+}
+
+type blockedAcceptSocket struct {
+	deviceSock
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (sock *blockedAcceptSocket) DecryptCallKey(context.Context, types.JID, *waBinary.Node) ([]byte, error) {
+	close(sock.entered)
+	<-sock.release
+	return make([]byte, 32), nil
+}
+
+func TestAcceptWaitingForDecryptionCannotReplaceWinningDevice(t *testing.T) {
+	primary := lidDevice("62440234549366", 0)
+	companion := lidDevice("62440234549366", 33)
+	sock := &blockedAcceptSocket{entered: make(chan struct{}), release: make(chan struct{})}
+	m := ringingManager(sock, []types.JID{primary, companion})
+	node := acceptNode("CALL1", companion)
+	node.GetChildren()[0].Content = []waBinary.Node{{Tag: "enc", Attrs: waBinary.Attrs{"type": "msg"}}}
+	done := make(chan struct{})
+	go func() {
+		m.HandleCallAccept(context.Background(), node, companion)
+		close(done)
+	}()
+	<-sock.entered
+	m.HandleCallAccept(context.Background(), acceptNode("CALL1", primary), primary)
+	before := len(sock.sent)
+	close(sock.release)
+	<-done
+	if m.acceptedByJid != primary.String() || len(sock.sent) != before {
+		t.Fatalf("accept que perdeu durante decriptação alterou o vencedor: accepted_by=%s sent=%d->%d",
+			m.acceptedByJid, before, len(sock.sent))
+	}
+	if dests, ok := elsewhereDests(sock.sent); ok {
+		t.Fatalf("accept ambíguo vencedor não deve mandar fan-out: %v", dests)
 	}
 }
 

@@ -150,10 +150,9 @@ func BuildTerminateStanza(peerJid types.JID, callID string, callCreator types.JI
 }
 
 // BuildTerminateElsewhereStanza avisa os dispositivos do destino que NÃO
-// atenderam para pararem de tocar. Quando um device companheiro do destino
-// atende, quem originou a chamada precisa fazer esse fan-out — senão os demais
-// devices do destino ficam tocando até o timeout (e o reject tardio deles
-// chegaria no meio da chamada já ativa).
+// atenderam para pararem de tocar. O chamador deve identificar com certeza o
+// device que atendeu antes de montar a lista; um accept bare não permite isso.
+// Sem fan-out, alguns devices podem continuar tocando até o timeout/terminate.
 func BuildTerminateElsewhereStanza(peerJid types.JID, callID string, callCreator types.JID, devices []types.JID) waBinary.Node {
 	tos := make([]waBinary.Node, len(devices))
 	for i, jid := range devices {

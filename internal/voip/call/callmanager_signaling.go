@@ -96,8 +96,16 @@ func (m *CallManager) HandleCallOffer(ctx context.Context, node *waBinary.Node, 
 }
 
 func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node, peerJid types.JID) {
+	info := signaling.ExtractNodeInfo(node)
+	if info == nil || info.Tag != "accept" {
+		return
+	}
 	m.mu.Lock()
 	call := m.currentCall
+	if call == nil || call.CallID != info.CallID || call.IsEnded() {
+		m.mu.Unlock()
+		return
+	}
 	// First accept wins: um accept posterior de OUTRO device (sibling) não pode
 	// trocar acceptedByJid nem rekey o SRTP com a mídia já estabelecida. Um retry
 	// do MESMO device passa: o primeiro accept pode ter trazido uma call key que
@@ -105,13 +113,11 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	// reparar a chave.
 	if accepted := m.acceptedByJid; accepted != "" && accepted != peerJid.String() {
 		m.mu.Unlock()
-		m.log.Info("accept from another device ignored", "accepted_by", accepted, "from", peerJid.String())
+		m.log.Info("accept from another device ignored", "call_id", info.CallID,
+			"accepted_by", accepted, "from", peerJid.String())
 		return
 	}
 	m.mu.Unlock()
-	if call == nil {
-		return
-	}
 	// [frota 17/08 · chamadas-fantasma] Chamada RECEBIDA: um accept que CHEGA só pode ser de
 	// outro device da NOSSA conta (o cliente que ligou não manda accept). Se for um irmão
 	// (mesmo usuário, device diferente do nosso — Store.LID/ID têm o NOSSO device; o celular é
@@ -124,7 +130,7 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	ehIrmaoNosso := (peerJid.User == ownLid.User || peerJid.User == ownPn.User) &&
 		pj != ownLid.String() && pj != ownPn.String()
 	m.mu.Lock()
-	if call.IsEnded() {
+	if m.currentCall != call || call.IsEnded() {
 		// accept retransmitido de chamada já morta: NÃO segue ao caminho normal (re-setaria
 		// acceptedByJid, rekey SRTP e video.Setup pós-cleanup para um leg inexistente).
 		m.mu.Unlock()
@@ -135,8 +141,8 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 			// Dual-accept: o operador JÁ atendeu no softphone (Connecting/Active) e o accept
 			// do celular chegou atrasado (fan-out leva o RTT). First local accept wins — o
 			// accept do irmão NÃO prova que ele venceu; derrubar aqui mataria a chamada que
-			// o operador acabou de atender. Se o caller escolheu o celular, o terminate dele
-			// chega e É processado (guard do HandleCallTerminate) — nada fica fantasma.
+			// o operador acabou de atender. Um desligamento normal do caller continua
+			// sendo processado por HandleCallTerminate.
 			m.mu.Unlock()
 			m.log.Info("sibling accept ignored: our leg already accepted locally",
 				"call_id", call.CallID, "from", pj)
@@ -156,22 +162,27 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 		return
 	}
 	m.mu.Unlock()
-	info := signaling.ExtractNodeInfo(node)
-	if info == nil {
-		return
-	}
-
-	if signaling.NeedsDecryption(info.Tag) {
-		if peerKey, err := signaling.DecryptCallKeyInNode(ctx, m.sock, info.InnerNode, peerJid); err == nil && peerKey != nil {
-			m.mu.Lock()
-			if call.EncryptionKey != nil && !equalBytes(call.EncryptionKey, peerKey) {
-				m.reinitSrtpLocked(peerKey, peerJid)
-			}
-			m.mu.Unlock()
-		}
+	peerKey, err := signaling.DecryptCallKeyInNode(ctx, m.sock, info.InnerNode, peerJid)
+	if err != nil {
+		m.log.Warn("accept decrypt call key failed", "call_id", info.CallID,
+			"from", peerJid.String(), "err", err)
 	}
 
 	m.mu.Lock()
+	if m.currentCall != call || call.IsEnded() {
+		m.mu.Unlock()
+		return
+	}
+	// A decriptação libera mu; outro accept pode ter vencido enquanto aguardávamos.
+	if accepted := m.acceptedByJid; accepted != "" && accepted != peerJid.String() {
+		m.mu.Unlock()
+		m.log.Info("accept from another device ignored", "call_id", info.CallID,
+			"accepted_by", accepted, "from", peerJid.String())
+		return
+	}
+	if peerKey != nil && call.EncryptionKey != nil && !equalBytes(call.EncryptionKey, peerKey) {
+		m.reinitSrtpLocked(peerKey, peerJid)
+	}
 	_ = call.ApplyTransition(Transition{Type: TransitionRemoteAccepted})
 	m.emitState()
 	firstAccept := m.acceptedByJid == ""
@@ -184,16 +195,15 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	m.initSrtpKeysLocked()
 	hasConn := m.relay.HasConnection()
 	relayData := call.RelayData
-	// Só no PRIMEIRO accept fazemos o fan-out do "accepted_elsewhere" para os
-	// demais devices do destino (os que não atenderam) pararem de tocar.
+	// Só fazemos fan-out quando o accept identifica um companion presente no
+	// offer. Um from bare (Device == 0) não prova que o primary atendeu; comparar
+	// Strings nesse caso incluiria o companion que pode estar na chamada viva.
 	var siblings []types.JID
+	answeringDeviceKnown := false
 	if firstAccept {
-		for _, dev := range m.calleeDevices {
-			if dev.String() != peerJid.String() {
-				siblings = append(siblings, dev)
-			}
-		}
+		siblings, answeringDeviceKnown = nonAnsweringCalleeDevices(peerJid, m.calleeDevices)
 	}
+	calleeDeviceCount := len(m.calleeDevices)
 	basePeer := call.PeerJid
 	m.mu.Unlock()
 
@@ -204,6 +214,10 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 
 	callID := call.CallID
 	creator := wanode.MustJID(call.CallCreator)
+	if firstAccept && !answeringDeviceKnown && calleeDeviceCount > 0 {
+		m.log.Info("accepted_elsewhere fanout skipped: answering device ambiguous",
+			"call_id", callID, "from", peerJid.String(), "callee_devices", calleeDeviceCount)
+	}
 	if len(siblings) > 0 {
 		elsewhere := signaling.BuildTerminateElsewhereStanza(wanode.MustJID(basePeer), callID, creator, siblings)
 		if err := m.sock.SendNode(ctx, elsewhere); err != nil {
@@ -246,6 +260,31 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	} else if relayData != nil {
 		m.connectRelays(relayData.Endpoints)
 	}
+}
+
+// nonAnsweringCalleeDevices exige um device explícito e exatamente identificado
+// na lista usada no offer. Não inferimos device 0 nem equivalência entre PN/LID.
+func nonAnsweringCalleeDevices(answerer types.JID, devices []types.JID) ([]types.JID, bool) {
+	if answerer.Device == 0 || answerer.IsEmpty() {
+		return nil, false
+	}
+	found := false
+	for _, dev := range devices {
+		if dev.String() == answerer.String() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, false
+	}
+	var siblings []types.JID
+	for _, dev := range devices {
+		if dev.String() != answerer.String() {
+			siblings = append(siblings, dev)
+		}
+	}
+	return siblings, true
 }
 
 func (m *CallManager) HandleCallTransport(ctx context.Context, node *waBinary.Node, peerJid types.JID) {
@@ -346,6 +385,17 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node) {
 		if r := wanode.AttrString(info.InnerNode.Attrs, "reason"); r != "" {
 			reason = core.EndCallReason(r)
 		}
+	}
+	// Dual-accept: accepted_elsewhere só cancela os legs que ainda tocam. Depois
+	// do aceite LOCAL e da conexão de mídia, essa notificação pode ser fan-out
+	// ambíguo do caller. Não derruba a conversa; um terminate normal segue valendo.
+	if call.Direction == core.CallDirectionIncoming && call.StateData.AcceptedAt != nil &&
+		(call.IsActive() || call.StateData.State == core.CallStateOnHold) &&
+		reason == core.EndCallReasonAcceptedElsewhere {
+		m.mu.Unlock()
+		m.log.Info("accepted_elsewhere ignored: our leg already accepted locally and active",
+			"call_id", call.CallID, "from", sender)
+		return
 	}
 
 	// [upstream c6073d6] Um device secundário hosted.lid vinculado à nossa própria conta

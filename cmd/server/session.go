@@ -691,8 +691,13 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.CallOffer:
 		s.onIncomingOffer(ctx, evt)
 	case *events.CallAccept:
+		s.log.Info("call accept received", "call_id", evt.CallID, "from", evt.From.String(),
+			"platform", evt.RemotePlatform)
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallAccept(ctx, wrapCall(evt.From, evt.Data), evt.From)
+		} else {
+			s.log.Warn("call accept ignored: no call in this session", "call_id", evt.CallID,
+				"from", evt.From.String())
 		}
 	case *events.CallTransport:
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
@@ -707,8 +712,7 @@ func (s *Session) handleEvent(rawEvt any) {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data))
 		}
 	case *events.UnknownCallEvent:
-		// stanzas de call sem evento tipado no whatsmeow — hoje o que nos interessa é
-		// o <video state=N> de upgrade/downgrade mid-call.
+		// Inclui accept/terminate/reject com vários filhos e vídeo mid-call.
 		s.handleUnknownCall(ctx, evt)
 	}
 }
@@ -717,12 +721,26 @@ func (s *Session) handleUnknownCall(ctx context.Context, evt *events.UnknownCall
 	if evt.Node == nil {
 		return
 	}
-	callID := callIDFromNode(evt.Node)
+	node := evt.Node
+	// Terminal tem precedência; isolar a ação também preserva seu reason quando
+	// relaylatency ou outro nó auxiliar é o primeiro filho.
+	terminal := callActionNode(node, "terminate", "reject")
+	accept := callActionNode(node, "accept")
+	if terminal != nil {
+		node = terminal
+	} else if accept != nil {
+		node = accept
+	}
+	callID := callIDFromNode(node)
 	if callID == "" {
 		return
 	}
 	ac, ok := s.reg.get(callID)
 	if !ok {
+		if accept != nil {
+			s.log.Warn("call accept ignored: no call in this session", "call_id", callID,
+				"from", wanode.AttrString(node.Attrs, "from"))
+		}
 		return
 	}
 	// O whatsmeow só emite CallTerminate/CallReject tipado quando o <call> tem UM
@@ -731,9 +749,15 @@ func (s *Session) handleUnknownCall(ctx context.Context, evt *events.UnknownCall
 	// nós (relaylatency etc.), e isso cai aqui como UnknownCallEvent — antes era
 	// ignorado, então a chamada nunca encerrava (ringtone preso nos atendentes e
 	// vaga presa no limite de chamadas). Agora tratamos como terminal.
-	if nodeHasTerminalCall(evt.Node) {
+	if terminal != nil {
 		s.log.Info("call encerrada em outro device (terminal via UnknownCallEvent)", "call_id", callID)
-		ac.cm.HandleCallTerminate(evt.Node) // → OnEnded → broker.endCall (avisa TODOS) + removeCall
+		ac.cm.HandleCallTerminate(node) // → OnEnded → broker.endCall (avisa TODOS) + removeCall
+		return
+	}
+	if accept != nil {
+		from := node.AttrGetter().JID("from")
+		s.log.Info("call accept received via UnknownCallEvent", "call_id", callID, "from", from.String())
+		ac.cm.HandleCallAccept(ctx, node, from)
 		return
 	}
 	ac.cm.HandleVideoState(ctx, evt.Node)

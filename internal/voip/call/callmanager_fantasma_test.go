@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"wacalls/internal/voip/core"
+	"wacalls/internal/voip/wanode"
 
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
@@ -81,6 +82,77 @@ func TestIrmaoAcceptIgnoradoAposAtenderLocal(t *testing.T) {
 	}
 	if m.acceptedByJid != "" {
 		t.Fatalf("acceptedByJid não podia ser tomado pelo irmão: %q", m.acceptedByJid)
+	}
+}
+
+func TestAcceptedElsewhereAfterLocalAcceptKeepsActiveMotorLeg(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(map[bool]string{false: "active", true: "on hold"}[held], func(t *testing.T) {
+			m := incomingManager(&fakeSock{})
+			t.Cleanup(m.cleanupMedia)
+			ended := 0
+			m.OnEnded = func(*CallInfo) { ended++ }
+			if err := m.AcceptCall(context.Background(), "CALL1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.currentCall.ApplyTransition(Transition{Type: TransitionMediaConnected}); err != nil {
+				t.Fatal(err)
+			}
+			if held {
+				if err := m.Hold(false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			state := m.currentCall.StateData.State
+			caller := wanode.MustJID(m.currentCall.PeerJid)
+			node := terminateNode("CALL1", caller)
+			node.GetChildren()[0].Attrs["reason"] = "accepted_elsewhere"
+			m.HandleCallTerminate(node)
+			m.HandleCallTerminate(node) // retry também não limpa mídia nem chama OnEnded
+			if m.currentCall.StateData.State != state || ended != 0 {
+				t.Fatalf("accepted_elsewhere derrubou leg local ativo: state=%s ended=%d", m.currentCall.StateData.State, ended)
+			}
+			m.HandleCallTerminate(terminateNode("CALL1", caller))
+			if !m.currentCall.IsEnded() || ended != 1 {
+				t.Fatalf("desligamento normal deve encerrar: state=%s ended=%d", m.currentCall.StateData.State, ended)
+			}
+		})
+	}
+}
+
+func TestAcceptedElsewhereGuardRequiresIncomingLocalAcceptAndActiveMedia(t *testing.T) {
+	cases := []struct {
+		name      string
+		outgoing  bool
+		local     bool
+		connected bool
+	}{
+		{name: "incoming still ringing"},
+		{name: "incoming local accept still connecting", local: true},
+		{name: "outgoing active", outgoing: true, connected: true},
+		{name: "incoming active without local accept", connected: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			m := incomingManager(&fakeSock{})
+			if tt.outgoing {
+				m.currentCall.Direction = core.CallDirectionOutgoing
+			}
+			if tt.local {
+				if err := m.currentCall.ApplyTransition(Transition{Type: TransitionLocalAccepted}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.connected {
+				m.currentCall.StateData.State = core.CallStateActive
+			}
+			node := terminateNode("CALL1", wanode.MustJID(m.currentCall.PeerJid))
+			node.GetChildren()[0].Attrs["reason"] = "accepted_elsewhere"
+			m.HandleCallTerminate(node)
+			if !m.currentCall.IsEnded() || m.currentCall.StateData.EndReason != core.EndCallReasonAcceptedElsewhere {
+				t.Fatalf("guard amplo demais: state=%s reason=%s", m.currentCall.StateData.State, m.currentCall.StateData.EndReason)
+			}
+		})
 	}
 }
 

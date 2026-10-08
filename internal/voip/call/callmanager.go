@@ -268,11 +268,20 @@ func (m *CallManager) AcceptCall(ctx context.Context, callID string) error {
 		} else {
 			// envia o accept em background: não bloquear a UI até 15s no timeout do ack
 			go func() {
-				if _, err := m.sock.Query(context.Background(), acceptNode); err != nil {
-					m.log.Error("accept query error", "err", err)
+				ack, err := m.sock.Query(context.Background(), acceptNode)
+				if err != nil {
+					m.log.Error("accept query error", "call_id", callID, "err", err)
+				} else if ack == nil {
+					m.log.Warn("accept sent without server ack", "call_id", callID)
+				} else if code := wanode.AttrString(ack.Attrs, "error"); code != "" {
+					m.log.Warn("accept rejected by server", "call_id", callID, "error", code)
+				} else {
+					m.log.Info("accept acknowledged by server", "call_id", callID)
 				}
 			}()
 		}
+	} else {
+		m.log.Warn("accept not sent: incoming call has no encryption key", "call_id", callID)
 	}
 
 	if relayData != nil {
