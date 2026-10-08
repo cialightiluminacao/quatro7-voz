@@ -41,6 +41,7 @@ func testPipeline(t *testing.T) (*Pipeline, *fakeRelay, *media.SrtpSession) {
 	t.Helper()
 	r := &fakeRelay{connected: true}
 	p := New(nil, r)
+	t.Cleanup(p.Reset)
 	km := core.SrtpKeyingMaterial{MasterKey: make([]byte, 16), MasterSalt: make([]byte, 14)}
 	if err := p.Setup("CID", "999:1@lid", "111:1@lid", km, km); err != nil {
 		t.Fatal(err)
@@ -216,8 +217,15 @@ func TestFUASequenceGapWaitsForIDR(t *testing.T) {
 				} // marker com FU incompleto
 				receivePacket(t, p, peer, uint16(65531+i), 20, marker, f, nil)
 			}
+			// Aguarda a janela de jitter antes de declarar a perda definitiva.
+			p.mu.Lock()
+			p.drainReceiveLocked(p.now().Add(videoReorderWait))
+			p.mu.Unlock()
 			receivePacket(t, p, peer, 65534, 30, true, []byte{0x41, 3}, nil)
 			receivePacket(t, p, peer, 65535, 40, true, []byte{0x67, 4}, nil)
+			p.mu.Lock()
+			p.drainReceiveLocked(p.now().Add(videoReorderWait))
+			p.mu.Unlock()
 			if len(frames) != 1 {
 				t.Fatalf("referências quebradas entregues: %d frames", len(frames))
 			}
@@ -249,8 +257,8 @@ func TestReceiveMultiNALGapAndDuplicates(t *testing.T) {
 	receivePacket(t, p, peer, 103, 1, true, []byte{0x7c, 0x45, 3}, nil)
 	receivePacket(t, p, peer, 102, 1, false, []byte{0x7c, 5, 2}, nil) // atrasado
 	receivePacket(t, p, peer, 104, 2, true, []byte{0x41, 4}, nil)
-	if len(frames) != 0 {
-		t.Fatal("AU parcial foi entregue")
+	if len(frames) != 2 || !bytes.Equal(frames[0], []byte{0, 0, 0, 1, 0x67, 1, 0, 0, 0, 1, 0x65, 1, 2, 3}) || p.receive.needIDR {
+		t.Fatal("reordenação perdeu AU completa")
 	}
 	// Formato WhatsApp: SPS/PPS/IDR juntos, fragmentados como uma NAL.
 	nalu := append([]byte{0x67, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65}, bytes.Repeat([]byte{9}, 1800)...)
@@ -258,7 +266,7 @@ func TestReceiveMultiNALGapAndDuplicates(t *testing.T) {
 	for i, f := range frag {
 		receivePacket(t, p, peer, uint16(105+i), 3, i == len(frag)-1, f, nil)
 	}
-	if len(frames) != 1 || !bytes.Equal(frames[0], append([]byte{0, 0, 0, 1}, nalu...)) {
+	if len(frames) != 3 || !bytes.Equal(frames[2], append([]byte{0, 0, 0, 1}, nalu...)) {
 		t.Fatal("IDR dentro de AU empacotada não recuperou")
 	}
 }
@@ -437,10 +445,13 @@ func TestReceiveIDRWaitCeilingAndSequenceRestart(t *testing.T) {
 	p.OnFrame = func(au []byte) { frames = append(frames, au) }
 	receivePacket(t, p, peer, 100, 1, true, []byte{0x65, 1}, nil)
 	receivePacket(t, p, peer, 102, 2, true, []byte{0x41, 1}, nil)
+	p.mu.Lock()
+	p.drainReceiveLocked(now.Add(videoReorderWait))
+	p.mu.Unlock()
 	now = now.Add(2 * time.Second)
 	receivePacket(t, p, peer, 103, 3, true, []byte{0x41, 2}, nil)
-	if len(frames) != 2 || p.receive.needIDR {
-		t.Fatal("IDR ceiling did not resume video")
+	if len(frames) != 2 || !p.receive.needIDR || !p.receive.idrWaitExpired {
+		t.Fatal("IDR ceiling must forward deltas and keep requesting recovery")
 	}
 	for seq := uint16(1); seq <= 8; seq++ {
 		receivePacket(t, p, peer, seq, uint32(seq+10), true, []byte{0x65, 3}, nil)

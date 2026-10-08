@@ -49,7 +49,7 @@ type receiveState struct {
 	damaged        bool
 	needIDR        bool
 	idrWaitAt      time.Time
-	latePackets    int
+	idrWaitExpired bool
 	fuActive       bool
 	fuHeader       byte
 	orientation    int
@@ -58,7 +58,11 @@ type receiveState struct {
 	auBytes        int
 }
 
-func (p *Pipeline) discardReceiveAULocked() {
+func (p *Pipeline) discardReceiveAULocked(reason string) {
+	if !p.receive.damaged {
+		p.log.Debug("video receive AU discarded", "reason", reason, "ssrc", p.receive.ssrc, "seq", p.receive.lastSeq, "timestamp", p.receive.timestamp,
+			"duplicates", p.reorder.duplicates, "reordered", p.reorder.reordered, "late", p.reorder.late, "missing", p.reorder.missing)
+	}
 	p.frameBuf = nil
 	p.depack = &transport.H264Depacketizer{}
 	p.receive.damaged = true
@@ -79,26 +83,20 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	if r.seqKnown {
 		distance := int16(h.SequenceNumber - r.lastSeq)
 		if distance <= 0 {
-			r.latePackets++
-			if r.latePackets < 8 {
-				return nil, false
-			}
-			p.discardReceiveAULocked()
-			r.haveTimestamp, r.active = false, false
-		} else {
-			r.latePackets = 0
+			return nil, false // duplicatas/atrasados nunca danificam a AU
 		}
 		if distance != 1 {
+			p.log.Debug("video receive sequence gap", "missing", uint16(distance-1), "duplicates", p.reorder.duplicates, "reordered", p.reorder.reordered, "late", p.reorder.late)
 			p.requireReceiveIDRLocked()
 			if r.active && h.Timestamp == r.timestamp {
-				p.discardReceiveAULocked()
+				p.discardReceiveAULocked("sequence-gap")
 			}
 		}
 	}
 	r.ssrc, r.lastSeq, r.seqKnown = h.Ssrc, h.SequenceNumber, true
 	if !r.haveTimestamp || h.Timestamp != r.timestamp {
 		if r.active {
-			p.discardReceiveAULocked() // marker/fim do FU-A perdido
+			p.discardReceiveAULocked("timestamp-before-marker") // marker/fim do FU-A perdido
 		}
 		p.frameBuf = nil
 		p.depack = &transport.H264Depacketizer{}
@@ -115,12 +113,14 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	}
 	if !r.damaged {
 		r.auBytes += len(pkt.Payload)
-		if r.auBytes > maxReceiveAUBytes || !r.validPayload(pkt.Payload) {
-			p.discardReceiveAULocked()
+		if r.auBytes > maxReceiveAUBytes {
+			p.discardReceiveAULocked("access-unit-limit")
+		} else if !r.validPayload(pkt.Payload) {
+			p.discardReceiveAULocked("invalid-h264-payload")
 		} else {
 			for _, nalu := range p.depack.Depacketize(pkt.Payload) {
 				if len(p.frameBuf)+len(nalu)+4 > maxReceiveAUBytes {
-					p.discardReceiveAULocked()
+					p.discardReceiveAULocked("access-unit-limit")
 					break
 				}
 				p.frameBuf = append(p.frameBuf, annexBStartCode...)
@@ -132,7 +132,7 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 		return nil, false
 	}
 	if r.fuActive {
-		p.discardReceiveAULocked() // marker com FU-A ainda incompleto
+		p.discardReceiveAULocked("incomplete-fu-at-marker") // marker com FU-A ainda incompleto
 	}
 	r.active = false
 	changed := false
@@ -181,9 +181,12 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 		if p.now().Sub(r.idrWaitAt) < 2*time.Second {
 			return nil, changed
 		}
-		p.log.Info("video receive IDR wait expired", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
-		r.needIDR = false
-		r.idrWaitAt = time.Time{}
+		if !r.idrWaitExpired {
+			p.log.Info("video receive IDR wait expired", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
+			r.idrWaitExpired = true
+		}
+		// AU completa continua delta. Mantém pedidos até IDR real; expirar a
+		// espera não restaura referências de um decoder reiniciado no painel.
 	}
 	if idr {
 		if r.needIDR {
@@ -191,6 +194,7 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 		}
 		r.needIDR = false
 		r.idrWaitAt = time.Time{}
+		r.idrWaitExpired = false
 	}
 	if p.envelopeCapable {
 		au = envelopeAU(au, r.orientation, idr, r.auSequence, h.Timestamp)
@@ -251,6 +255,7 @@ func (r *receiveState) validPayload(payload []byte) bool {
 func (p *Pipeline) requireReceiveIDRLocked() {
 	if !p.receive.needIDR || p.receive.idrWaitAt.IsZero() {
 		p.receive.idrWaitAt = p.now()
+		p.receive.idrWaitExpired = false
 	}
 	p.receive.needIDR = true
 }

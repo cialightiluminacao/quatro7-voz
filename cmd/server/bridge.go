@@ -92,8 +92,9 @@ type Bridge struct {
 
 	OnBrowserRTP func(payload []byte)
 	// OnBrowserVideo is invoked with H264 access units captured from the browser camera.
-	OnBrowserVideo  func(au []byte)
-	OnVideoEnvelope func(callID string) // texto Q1: a call passa a receber envelope versão 1
+	OnBrowserVideo      func(au []byte)
+	OnVideoEnvelope     func(callID string) // texto Q1: a call passa a receber envelope versão 1
+	OnPeerVideoKeyframe func(callID string) // texto KF: decoder do browser precisa de IDR do peer
 	// OnTerminalICE fires when the peer connection fails or closes.
 	OnTerminalICE func()
 	// terminateDisabled silencia o OnTerminalICE. Usado ao TROCAR a ponte (ex.:
@@ -191,8 +192,15 @@ func newBridgeWithAPI(offerSDP string, log *slog.Logger, api *webrtc.API) (*Brid
 
 func (b *Bridge) handleVideoMessage(msg webrtc.DataChannelMessage) {
 	if msg.IsString {
-		if string(msg.Data) == "Q1" && b.OnVideoEnvelope != nil {
-			b.OnVideoEnvelope(b.callID)
+		switch string(msg.Data) {
+		case "Q1":
+			if b.OnVideoEnvelope != nil {
+				b.OnVideoEnvelope(b.callID)
+			}
+		case "KF":
+			if b.OnPeerVideoKeyframe != nil {
+				b.OnPeerVideoKeyframe(b.callID)
+			}
 		}
 		return
 	}

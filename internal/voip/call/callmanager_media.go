@@ -161,6 +161,10 @@ func (m *CallManager) onRelayData(data []byte) {
 	if transport.IsStunPacket(data) {
 		return
 	}
+	if media.IsRTCPPacket(data) {
+		m.video.HandleRTCP(data)
+		return
+	}
 	if !transport.IsRtpPacket(data) {
 		return
 	}
@@ -171,9 +175,7 @@ func (m *CallManager) onRelayData(data []byte) {
 	case core.PayloadTypeWhatsAppOpus:
 		m.handleAudioRelayData(data)
 	case core.PayloadTypeWhatsAppH264:
-		m.peerVideoReceiveMu.Lock()
 		m.video.HandleRelayData(data)
-		m.peerVideoReceiveMu.Unlock()
 	}
 }
 

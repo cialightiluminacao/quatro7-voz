@@ -690,6 +690,9 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 	bridge.OnVideoEnvelope = func(negotiatedCallID string) {
 		ac.cm.EnableVideoEnvelopeForBridge(negotiatedCallID, bridge.mediaEpoch.Load())
 	}
+	bridge.OnPeerVideoKeyframe = func(requestCallID string) {
+		ac.cm.RequestPeerVideoKeyframeForBridge(requestCallID, bridge.mediaEpoch.Load())
+	}
 	bridge.OnTerminalICE = func() {
 		epoch := bridge.mediaEpoch.Load()
 		go ac.cm.EndBrowserCall(context.Background(), core.EndCallReasonUserEnded, epoch)

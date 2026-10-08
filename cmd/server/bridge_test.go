@@ -52,22 +52,31 @@ func makeBrowserOffer(t *testing.T) string {
 func TestBridgeVideoControlNegotiation(t *testing.T) {
 	b := &Bridge{}
 	negotiations := 0
+	keyframes := 0
+	b.callID = "CID"
 	var received [][]byte
 	b.OnVideoEnvelope = func(string) { negotiations++ }
+	b.OnPeerVideoKeyframe = func(id string) {
+		if id != "CID" {
+			t.Fatalf("KF callID=%q", id)
+		}
+		keyframes++
+	}
 	b.OnBrowserVideo = func(au []byte) { received = append(received, au) }
 	for _, msg := range []webrtc.DataChannelMessage{
 		{IsString: true, Data: []byte("Q1")},
 		{IsString: true, Data: []byte("Q2")},
 		{IsString: true, Data: []byte("Q1\n")},
 		{IsString: true, Data: []byte("KF")},
+		{IsString: true, Data: []byte("KF\n")},
 		{Data: []byte("Q1")}, // Q1 binário é mídia, não negociação
 		{Data: []byte{0, 0, 0, 1, 0x65, 1}},
 		{},
 	} {
 		b.handleVideoMessage(msg)
 	}
-	if negotiations != 1 || len(received) != 2 || !bytes.Equal(received[0], []byte("Q1")) {
-		t.Fatalf("Q1=%d AUs=%x", negotiations, received)
+	if negotiations != 1 || keyframes != 1 || len(received) != 2 || !bytes.Equal(received[0], []byte("Q1")) {
+		t.Fatalf("Q1=%d KF=%d AUs=%x", negotiations, keyframes, received)
 	}
 }
 

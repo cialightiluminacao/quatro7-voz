@@ -107,6 +107,7 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 	relay.SetOnReceive(func(data []byte) { m.onRelayData(data) })
 	m.relay = relay
 	m.video = callvideo.New(log, relay)
+	m.video.ReceiveGuard = &m.peerVideoReceiveMu
 	m.video.OnOrientation = m.notePeerVideoOrientation
 	m.video.OnKeyframeRequired = func() {
 		if m.OnVideoKeyframeRequest != nil {

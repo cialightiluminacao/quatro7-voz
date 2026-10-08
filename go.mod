@@ -7,6 +7,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/pion/ice/v4 v4.2.7
+	github.com/pion/srtp/v3 v3.0.11
 	github.com/pion/webrtc/v4 v4.2.15
 	go.mau.fi/util v0.10.1
 	go.mau.fi/whatsmeow v0.0.0-20260921121126-35ae40906e74
@@ -37,7 +38,6 @@ require (
 	github.com/pion/rtp v1.10.2 // indirect
 	github.com/pion/sctp v1.10.0 // indirect
 	github.com/pion/sdp/v3 v3.0.18 // indirect
-	github.com/pion/srtp/v3 v3.0.11 // indirect
 	github.com/pion/stun/v3 v3.1.5 // indirect
 	github.com/pion/transport/v4 v4.0.2 // indirect
 	github.com/pion/turn/v5 v5.0.9 // indirect

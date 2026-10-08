@@ -38,6 +38,7 @@ type Pipeline struct {
 	receiveMu  sync.Mutex // serializa recepção e callbacks; nunca adquirido sob mu
 	rtp        *media.RtpSession
 	srtp       *media.SrtpSession
+	srtcp      *media.SrtcpSession
 	selfSsrc   uint32
 	depack     *transport.H264Depacketizer
 	frameBuf   []byte
@@ -53,6 +54,14 @@ type Pipeline struct {
 	rtpOrientationKnown    bool
 	receive                receiveState
 	receiveSPS, receivePPS []byte
+	reorder                videoReorder
+	receiveTimer           *time.Timer
+	receiveEpoch           uint64
+	lastPeerKFAt           time.Time
+	rtcpSeen               map[uint16]bool
+	// Guard estável do CallManager: timers e pacotes compartilham o lock da
+	// troca de bridge. Adquirido antes de receiveMu e mu.
+	ReceiveGuard *sync.Mutex
 
 	// Estado da extensão de vídeo do WhatsApp (perfil 0xDEBE) no envio.
 	frameNumber      uint16 // nº do frame (por access unit), começa em 1
@@ -77,6 +86,10 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 	if err != nil {
 		return err
 	}
+	srtcp, err := media.NewSrtcpSession(sendKM, recvKM)
+	if err != nil {
+		return err
+	}
 	selfSsrc := media.GenerateSecureSsrc(callID, ourDeviceJid, slotWord)
 
 	selfSsrcs := make([]uint32, len(callSlots))
@@ -92,10 +105,16 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 		p.callID = callID
 	}
 	p.srtp = srtp
+	// Setup pode repetir com os mesmos masters: não reutilizar índice/IV nem
+	// apagar a janela de replay SRTCP dessa chamada.
+	srtcp.PreserveUnchangedKeys(p.srtcp)
+	p.srtcp = srtcp
 	p.selfSsrc = selfSsrc
 	p.rtp = media.NewH264Session(selfSsrc)
 	p.depack = &transport.H264Depacketizer{}
-	p.receive = receiveState{auSequence: p.receive.auSequence, needIDR: p.receive.seqKnown || p.receive.needIDR, idrWaitAt: p.receive.idrWaitAt}
+	p.receive = receiveState{auSequence: p.receive.auSequence, needIDR: true, idrWaitAt: p.now()}
+	p.stopReceiveTimerLocked()
+	p.reorder = videoReorder{}
 	p.frameBuf = nil
 	p.frameNumber = 1
 	p.transportSeq = 0
@@ -273,8 +292,8 @@ func hasIDR(nalus [][]byte) bool {
 }
 
 func (p *Pipeline) HandleRelayData(data []byte) {
-	p.receiveMu.Lock()
-	defer p.receiveMu.Unlock()
+	unlock := p.lockReceive()
+	defer unlock()
 	p.mu.Lock()
 	if p.srtp == nil || p.depack == nil || len(data) < 12 {
 		p.mu.Unlock()
@@ -291,17 +310,17 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 		p.log.Debug("video srtp unprotect error", "err", err)
 		return
 	}
-	frame, orientationChanged := p.receivePacketLocked(pkt)
-	cb := p.OnFrame
-	orientationCB, callID, orientation := p.OnOrientation, p.callID, p.peerOrientation
+	accepted, restarted := p.reorder.push(pkt, p.now())
+	if restarted {
+		p.discardReceiveAULocked("sequence-restart")
+		p.receive.seqKnown, p.receive.haveTimestamp, p.receive.active = false, false, false
+	}
+	if accepted {
+		p.drainReceiveLocked(p.now())
+	}
+	p.sendPeerKeyframeLocked()
+	p.scheduleReceiveLocked()
 	p.mu.Unlock()
-
-	if orientationChanged && orientationCB != nil {
-		orientationCB(callID, orientation)
-	}
-	if frame != nil && cb != nil {
-		cb(frame)
-	}
 }
 
 func (p *Pipeline) Reset() {
@@ -313,6 +332,7 @@ func (p *Pipeline) Reset() {
 func (p *Pipeline) resetLocked() {
 	p.rtp = nil
 	p.srtp = nil
+	p.srtcp = nil
 	p.selfSsrc = 0
 	p.depack = nil
 	p.frameBuf = nil
@@ -328,6 +348,10 @@ func (p *Pipeline) resetLocked() {
 	p.peerOrientation = 0
 	p.rtpOrientationKnown = false
 	p.receive = receiveState{}
+	p.stopReceiveTimerLocked()
+	p.reorder = videoReorder{}
+	p.lastPeerKFAt = time.Time{}
+	p.rtcpSeen = nil
 	p.receiveSPS, p.receivePPS = nil, nil
 }
 

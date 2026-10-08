@@ -256,3 +256,15 @@ func (m *CallManager) FeedBrowserVideo(epoch uint64, au []byte) {
 		m.video.FeedCaptured(au)
 	}
 }
+
+// Pedido do decoder da bridge atual; a bridge anterior não controla o novo leg.
+func (m *CallManager) RequestPeerVideoKeyframeForBridge(callID string, epoch uint64) {
+	m.browserVideoMu.Lock()
+	defer m.browserVideoMu.Unlock()
+	m.mu.Lock()
+	valid := epoch != 0 && epoch == m.browserEpoch && m.browserAttached && m.currentCall != nil && m.currentCall.CallID == callID && !m.currentCall.IsEnded()
+	m.mu.Unlock()
+	if valid {
+		m.video.RequestPeerKeyframe()
+	}
+}
