@@ -41,11 +41,12 @@ func TestH264DepacketizerRejectsMalformedAndUnsupportedPayloads(t *testing.T) {
 			t.Fatalf("payload=%x got=%x", payload, got)
 		}
 	}
-	for _, last := range [][]byte{{0x7c, 0x48, 2}, {0x5c, 0x45, 2}} {
+	// NRI diferente nas continuações é válido (iPhone); só tipo diferente rompe a FU.
+	for _, last := range [][]byte{{0x7c, 0x48, 2}} {
 		var d H264Depacketizer
 		d.Depacketize([]byte{0x7c, 0x85, 1})
 		if got := d.Depacketize(last); len(got) != 0 || d.fuActive {
-			t.Fatal("FU com tipo/NRI diferente aceito")
+			t.Fatal("FU com tipo diferente aceito")
 		}
 	}
 }
@@ -89,5 +90,20 @@ func TestH264PacketizerMTUBoundariesAndMarkers(t *testing.T) {
 		if len(got) != 1 || !bytes.Equal(got[0], nalu) {
 			t.Fatalf("size=%d roundtrip=%x", size, got)
 		}
+	}
+}
+
+// Chamada real 08/10 (iPhone): o 1º fragmento traz NRI (0x7c), as continuações vêm com NRI=0 (0x1c).
+func TestH264FUAContinuationWithZeroNRI(t *testing.T) {
+	var d H264Depacketizer
+	if got := d.Depacketize([]byte{0x7c, 0x87, 0x4d, 0x4c}); len(got) != 0 {
+		t.Fatal(got)
+	}
+	if got := d.Depacketize([]byte{0x1c, 0x07, 0x0c, 0x8c}); len(got) != 0 {
+		t.Fatal(got)
+	}
+	got := d.Depacketize([]byte{0x1c, 0x47, 0x68})
+	if len(got) != 1 || !bytes.Equal(got[0], []byte{0x67, 0x4d, 0x4c, 0x0c, 0x8c, 0x68}) {
+		t.Fatalf("SPS remontado = %x", got)
 	}
 }

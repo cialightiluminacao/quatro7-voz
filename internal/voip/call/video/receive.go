@@ -285,7 +285,10 @@ func (r *receiveState) validPayload(payload []byte) bool {
 		// fragmentos vazios e todos os 5 bits de tipo original. R é ignorado
 		// pelo receptor conforme RFC 6184 §5.8. Sequência, header e limites
 		// continuam estritos; não se adivinha nem remove prefixo proprietário.
-		header := payload[0]&0xe0 | typ
+		// iPhone/WhatsApp (chamada real 08/10): só o 1º fragmento traz NRI; os seguintes vêm com
+		// NRI=0 (7c87… → 1c07…). Comparar F/NRI rejeitava toda continuação — SPS/IDR nunca fechavam.
+		// O fragmento é amarrado só pelo tipo original; o cabeçalho do NAL vem do 1º fragmento.
+		header := typ
 		if start {
 			if r.fuActive {
 				return false

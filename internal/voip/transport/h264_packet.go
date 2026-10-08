@@ -209,7 +209,8 @@ func (d *H264Depacketizer) Depacketize(payload []byte) [][]byte {
 			d.fuBuf = append(d.fuBuf[:0], fbitAndNri|origType)
 			d.fuBuf = append(d.fuBuf, body...)
 		} else if d.fuActive {
-			if origType != d.fuType || fbitAndNri != d.fuNriF || len(d.fuBuf)+len(body) > maxFuReassemblyBytes {
+			// NRI das continuações pode vir 0 (iPhone/WhatsApp): vale o do 1º fragmento (d.fuNriF).
+			if origType != d.fuType || len(d.fuBuf)+len(body) > maxFuReassemblyBytes {
 				d.fuActive = false
 				d.fuBuf = d.fuBuf[:0]
 				return nil
