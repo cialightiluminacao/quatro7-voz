@@ -247,13 +247,14 @@ func (m *CallManager) FeedBrowserPCM(epoch uint64, pcm []float32) {
 }
 
 func (m *CallManager) FeedBrowserVideo(epoch uint64, au []byte) {
+	at := time.Now()
 	m.browserVideoMu.Lock()
 	defer m.browserVideoMu.Unlock()
 	m.mu.Lock()
 	valid := epoch != 0 && epoch == m.browserEpoch && m.browserAttached && m.currentCall != nil && !m.currentCall.IsEnded()
 	m.mu.Unlock()
 	if valid {
-		m.video.FeedCaptured(au)
+		m.video.FeedCapturedAt(au, at)
 	}
 }
 

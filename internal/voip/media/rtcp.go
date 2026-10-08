@@ -1,6 +1,9 @@
 package media
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Classifica antes do demux RTP: PT RTCP é o byte inteiro, incluindo o bit 7.
 // Referência: meowcaller c48c3e2, rtp/rtcp.go:26-36,375-439.
@@ -13,6 +16,27 @@ func BuildVideoPLI(sender, peer uint32) []byte {
 	binary.BigEndian.PutUint32(b[4:8], sender)
 	binary.BigEndian.PutUint32(b[8:12], peer)
 	return b
+}
+
+// Compound mínimo AVPF: RR sem report blocks, SDES/CNAME e feedback.
+// Todos os headers mantêm o bit de perfil de vídeo WhatsApp (0x10), como
+// meowcaller c48c3e2 rtp/rtcp.go:308-346,377-388 com profileExtension=true.
+// Sem esse bit o header PLI seria o 0x81 do RTP/AVPF padrão.
+func BuildVideoKeyframeRequest(sender, peer uint32) []byte {
+	rr := []byte{0x90, 201, 0, 1, 0, 0, 0, 0}
+	binary.BigEndian.PutUint32(rr[4:8], sender)
+	// Mesma forma nativa de 18 bytes (xxxxx@pjxxxxxx.org), estável por SSRC,
+	// sem JID. Referência: meowcaller rtp/rtcp.go:287-320.
+	cname := fmt.Sprintf("%05x@pj%06x.org", sender>>12, sender&0xffffff)
+	sdes := []byte{0x91, 202, 0, 0, 0, 0, 0, 0, 1, byte(len(cname))}
+	binary.BigEndian.PutUint32(sdes[4:8], sender)
+	sdes = append(sdes, cname...)
+	sdes = append(sdes, 0) // END item e alinhamento de 32 bits
+	for len(sdes)%4 != 0 {
+		sdes = append(sdes, 0)
+	}
+	binary.BigEndian.PutUint16(sdes[2:4], uint16(len(sdes)/4-1))
+	return append(append(rr, sdes...), BuildVideoPLI(sender, peer)...)
 }
 
 type RTCPInfo struct {

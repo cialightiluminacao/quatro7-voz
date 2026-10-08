@@ -56,7 +56,7 @@ func TestPeerKeyframeRateLimitAndRecoveryWithoutRotation(t *testing.T) {
 	p, r, peer := testPipeline(t)
 	p.EnableEnvelope()
 	now := time.Unix(100, 0)
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	var frames [][]byte
 	p.OnFrame = func(b []byte) { frames = append(frames, b) }
 	// SPS/PPS/IDR juntos como WhatsApp; nenhuma mudança de resolução/orientação.
@@ -103,7 +103,7 @@ func TestPeerKeyframeRateLimitAndRecoveryWithoutRotation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(plain, media.BuildVideoPLI(p.selfSsrc, 42)) || binary.BigEndian.Uint32(b[len(b)-14:len(b)-10]) != 0x80000001+uint32(i) {
+		if !bytes.Equal(plain, media.BuildVideoKeyframeRequest(p.selfSsrc, 42)) || binary.BigEndian.Uint32(b[len(b)-14:len(b)-10]) != 0x80000001+uint32(i) {
 			t.Fatalf("pedido %d=%x", i, plain)
 		}
 	}
@@ -197,7 +197,7 @@ func TestTimeoutNeverForwardsDamagedAUOrFakeKey(t *testing.T) {
 	p, _, peer := testPipeline(t)
 	p.EnableEnvelope()
 	now := time.Unix(100, 0)
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	var frames [][]byte
 	p.OnFrame = func(b []byte) { frames = append(frames, b) }
 	receivePacket(t, p, peer, 1, 1, true, []byte{0x65, 1}, nil)
@@ -216,7 +216,7 @@ func TestTimeoutNeverForwardsDamagedAUOrFakeKey(t *testing.T) {
 func TestAuthenticatedPeerRTCPFeedback(t *testing.T) {
 	p, _, _ := testPipeline(t)
 	now := time.Unix(100, 0)
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	requests := 0
 	p.OnKeyframeRequired = func() { requests++; p.EnableEnvelope() }
 	k := core.SrtpKeyingMaterial{MasterKey: make([]byte, 16), MasterSalt: make([]byte, 14)}
@@ -285,7 +285,7 @@ func TestRepeatedSetupPreservesSrtcpIndexAndReplay(t *testing.T) {
 	p.lastPeerKFAt = time.Time{}
 	p.mu.Unlock()
 	receivePacket(t, p, peer, 2, 2, true, []byte{0x41, 1}, nil)
-	if len(r.packets) != 2 || binary.BigEndian.Uint32(r.packets[1][12:16]) != 0x80000002 {
+	if len(r.packets) != 2 || binary.BigEndian.Uint32(r.packets[1][len(r.packets[1])-14:len(r.packets[1])-10]) != 0x80000002 {
 		t.Fatal("Setup reutilizou IV SRTCP")
 	}
 }

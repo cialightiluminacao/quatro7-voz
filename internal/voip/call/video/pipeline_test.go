@@ -53,6 +53,20 @@ func testPipeline(t *testing.T) (*Pipeline, *fakeRelay, *media.SrtpSession) {
 	return p, r, peer
 }
 
+// Testes que avançam o relógio manualmente também disparam flushReceive à mão.
+// Um timer real de 1 ns concorria com esse relógio e com as leituras do fakeRelay.
+// Os testes de timer/guard continuam usando time.AfterFunc real.
+func manualVideoClock(p *Pipeline, now *time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopReceiveTimerLocked()
+	p.now = func() time.Time { return *now }
+	p.afterFunc = func(time.Duration, func()) *time.Timer { return time.NewTimer(24 * time.Hour) }
+	if p.receive.needIDR {
+		p.receive.idrWaitAt = *now
+	}
+}
+
 func receivePacket(t *testing.T, p *Pipeline, peer *media.SrtpSession, seq uint16, ts uint32, marker bool, payload, ext []byte) {
 	t.Helper()
 	h := media.NewRtpHeader(core.PayloadTypeWhatsAppH264, seq, ts, 42)
@@ -275,7 +289,7 @@ func TestRelayDropRequestsKeyframeWithRateLimit(t *testing.T) {
 	p, r, _ := testPipeline(t)
 	p.EnableEnvelope()
 	now := time.Unix(100, 0)
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	var requests []time.Time
 	p.OnKeyframeRequired = func() { requests = append(requests, now); p.EnableEnvelope() } // callback sem mu
 	idr, delta := []byte{0, 0, 0, 1, 0x65, 1}, []byte{0, 0, 0, 1, 0x41, 2}
@@ -320,7 +334,7 @@ func TestCapturedTimestampsFollowElapsedTimeIncludingDrops(t *testing.T) {
 	p.EnableEnvelope()
 	start := time.Unix(100, 0)
 	now := start
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	idr, delta := []byte{0, 0, 0, 1, 0x65, 1}, []byte{0, 0, 0, 1, 0x41, 2}
 	// A espera do IDR antes da primeira AU não inicia o relógio.
 	p.FeedCaptured(delta)
@@ -440,7 +454,7 @@ func TestVideoConcurrentSendReceiveAndReset(t *testing.T) {
 func TestReceiveIDRWaitCeilingAndSequenceRestart(t *testing.T) {
 	p, _, peer := testPipeline(t)
 	now := time.Unix(100, 0)
-	p.now = func() time.Time { return now }
+	manualVideoClock(p, &now)
 	var frames [][]byte
 	p.OnFrame = func(au []byte) { frames = append(frames, au) }
 	receivePacket(t, p, peer, 100, 1, true, []byte{0x65, 1}, nil)
@@ -461,14 +475,14 @@ func TestReceiveIDRWaitCeilingAndSequenceRestart(t *testing.T) {
 	}
 }
 
-func TestCapturedLegacyAndQ1RecoveryCeiling(t *testing.T) {
+func TestCapturedLegacyAndQ1WaitForIDRAfterDrop(t *testing.T) {
 	for _, q1 := range []bool{false, true} {
 		p, r, _ := testPipeline(t)
 		if q1 {
 			p.EnableEnvelope()
 		}
 		now := time.Unix(100, 0)
-		p.now = func() time.Time { return now }
+		manualVideoClock(p, &now)
 		requests := 0
 		p.OnKeyframeRequired = func() { requests++ }
 		p.FeedCaptured([]byte{0, 0, 0, 1, 0x65, 1})
@@ -479,13 +493,17 @@ func TestCapturedLegacyAndQ1RecoveryCeiling(t *testing.T) {
 		if q1 && r.broadcasts != 1 {
 			t.Fatal("Q1 did not wait")
 		}
-		if !q1 && (r.broadcasts != 2 || requests != 0) {
-			t.Fatal("legacy panel stalled")
+		if !q1 && (r.broadcasts != 1 || requests != 1) {
+			t.Fatal("legacy precisa KF e IDR após drop")
 		}
 		now = now.Add(2 * time.Second)
 		p.FeedCaptured([]byte{0, 0, 0, 1, 0x41, 1})
-		if q1 && (r.broadcasts != 2 || p.keyframeRequired) {
-			t.Fatal("outbound wait ceiling")
+		if r.broadcasts != 1 || !p.keyframeRequired {
+			t.Fatal("delta sem referência após dois segundos")
+		}
+		p.FeedCaptured([]byte{0, 0, 0, 1, 0x65, 1})
+		if r.broadcasts != 2 || p.keyframeRequired {
+			t.Fatal("IDR não recuperou")
 		}
 	}
 }

@@ -1,6 +1,8 @@
 package video
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"time"
 	"wacalls/internal/voip/media"
 )
@@ -74,7 +76,7 @@ func (p *Pipeline) scheduleReceiveLocked() {
 		return
 	}
 	epoch := p.receiveEpoch
-	p.receiveTimer = time.AfterFunc(deadline.Sub(p.now()), func() { p.flushReceive(epoch) })
+	p.receiveTimer = p.afterFunc(deadline.Sub(p.now()), func() { p.flushReceive(epoch) })
 }
 
 func (p *Pipeline) flushReceive(epoch uint64) {
@@ -90,9 +92,8 @@ func (p *Pipeline) flushReceive(epoch uint64) {
 	p.scheduleReceiveLocked()
 }
 
-// Formato de chamada individual: meowcaller c48c3e2 engine_media.go:1014-1026,
-// 1395-1404 e rtp/rtcp.go:375-388. NÃO restaura o PLI 0x81 de ddd0c67,
-// revertido por 9f18bd1; o perfil de vídeo WhatsApp inclui bit 4 (0x91).
+// Mesmo SSRC/perfil/SRTCP do meowcaller c48c3e2, agora em compound
+// RR+SDES+PLI: 9f18bd1 registra suspeita de rejeição do PLI isolado.
 func (p *Pipeline) sendPeerKeyframeLocked() {
 	if !p.receive.needIDR || !p.receive.seqKnown || p.srtcp == nil || !p.relay.HasConnection() {
 		return
@@ -101,14 +102,22 @@ func (p *Pipeline) sendPeerKeyframeLocked() {
 	if !p.lastPeerKFAt.IsZero() && now.Sub(p.lastPeerKFAt) < time.Second {
 		return
 	}
-	packet, err := p.srtcp.Protect(media.BuildVideoPLI(p.selfSsrc, p.receive.ssrc))
+	plain := media.BuildVideoKeyframeRequest(p.selfSsrc, p.receive.ssrc)
+	packet, err := p.srtcp.Protect(plain)
 	if err != nil {
 		p.log.Debug("video keyframe request protection failed", "err", err)
 		return
 	}
 	p.lastPeerKFAt = now
+	p.peerPLICount++
+	if p.peerPLICount == 1 {
+		p.log.Debug("video first PLI", "call_id", p.callID, "count", p.peerPLICount,
+			"sender_ssrc", p.selfSsrc, "peer_ssrc", p.receive.ssrc,
+			"compound_hex", hex.EncodeToString(plain), "srtcp_hex", hex.EncodeToString(packet),
+			"srtcp_index", binary.BigEndian.Uint32(packet[len(packet)-14:len(packet)-10])&0x7fffffff)
+	}
 	p.relay.Broadcast(packet)
-	p.log.Debug("video peer keyframe requested", "peer_ssrc", p.receive.ssrc)
+	p.log.Debug("video peer keyframe requested", "peer_ssrc", p.receive.ssrc, "count", p.peerPLICount)
 }
 
 // KF do browser pede IDR do peer. Pode chegar antes do primeiro RTP autenticado;

@@ -71,6 +71,7 @@ type relayConnection struct {
 	localUfrag string
 	keepalive  *time.Ticker
 	stopCh     chan struct{}
+	sender     *relayMediaSender // criado sob m.mu antes de publicar estado open
 }
 
 type SctpRelayManager struct {
@@ -212,6 +213,8 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 			return
 		}
 		conn.state = relayStateOpen
+		conn.sender = newRelayMediaSender(channel, m.log, id, conn.stopCh, func() { m.sendErrors.Add(1) })
+		go conn.sender.run()
 		m.mu.Unlock()
 		m.log.Info("relay datachannel open", "id", id)
 		m.sendStunRegistration(conn)
@@ -437,10 +440,19 @@ func (m *SctpRelayManager) sendConsentBinding(conn *relayConnection) {
 }
 
 func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) error {
-	if conn.channel == nil || conn.state != relayStateOpen {
+	m.mu.Lock()
+	channel, sender, open := conn.channel, conn.sender, conn.state == relayStateOpen
+	m.mu.Unlock()
+	if channel == nil || !open {
 		return nil
 	}
-	if err := conn.channel.Send(data); err != nil {
+	var err error
+	if sender != nil {
+		err = sender.sendPriority(data)
+	} else {
+		err = channel.Send(data)
+	}
+	if err != nil {
 		m.log.Debug("relay send error", "id", conn.id, "err", err)
 		return err
 	}
@@ -451,10 +463,15 @@ func (m *SctpRelayManager) Broadcast(data []byte) {
 	m.mu.Lock()
 	conns := make([]*relayConnection, 0, len(m.connections))
 	for _, c := range m.connections {
-		conns = append(conns, c)
+		if c.state == relayStateOpen && c.channel != nil {
+			conns = append(conns, c)
+		}
 	}
 	m.mu.Unlock()
 	for _, c := range conns {
+		if len(data) >= 8 && data[0]>>6 == 2 && data[1] >= 192 && data[1] <= 223 {
+			m.log.Debug("relay RTCP target", "relay", c.id, "bytes", len(data))
+		}
 		if err := m.sendRaw(c, data); err != nil {
 			m.sendErrors.Add(1)
 		}
@@ -475,17 +492,17 @@ func (m *SctpRelayManager) countOpenLocked() int {
 
 func (m *SctpRelayManager) BufferedAmount() uint64 {
 	m.mu.Lock()
-	conns := make([]*relayConnection, 0, len(m.connections))
+	channels := make([]*webrtc.DataChannel, 0, len(m.connections))
 	for _, c := range m.connections {
-		conns = append(conns, c)
+		if c.state == relayStateOpen && c.channel != nil {
+			channels = append(channels, c.channel)
+		}
 	}
 	m.mu.Unlock()
 	var maxBuf uint64
-	for _, c := range conns {
-		if c.state == relayStateOpen && c.channel != nil {
-			if b := c.channel.BufferedAmount(); b > maxBuf {
-				maxBuf = b
-			}
+	for _, channel := range channels {
+		if b := channel.BufferedAmount(); b > maxBuf {
+			maxBuf = b
 		}
 	}
 	return maxBuf

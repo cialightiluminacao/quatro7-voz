@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	// Duas IDRs de até 128 KiB. Verificado antes da AU; nunca corta seus fragmentos.
+	// Backpressure global antes de packetizar; o relay aplica idade por AU e
+	// um teto menor de vídeo no SCTP, inclusive durante uma AU grande.
 	congestionDropBytes = 256 << 10
 	slotWord            = 2
 )
@@ -45,6 +46,7 @@ type Pipeline struct {
 	firstAUAt  time.Time
 	clockTicks uint32
 	now        func() time.Time
+	afterFunc  func(time.Duration, func()) *time.Timer
 	lastKFAt   time.Time
 	idrWaitAt  time.Time
 
@@ -58,6 +60,9 @@ type Pipeline struct {
 	receiveTimer           *time.Timer
 	receiveEpoch           uint64
 	lastPeerKFAt           time.Time
+	peerPLICount           uint64
+	outboundEpoch          uint64
+	outboundIDR            uint64
 	rtcpSeen               map[uint16]bool
 	// Guard estável do CallManager: timers e pacotes compartilham o lock da
 	// troca de bridge. Adquirido antes de receiveMu e mu.
@@ -78,7 +83,7 @@ func New(log *slog.Logger, relay Relay) *Pipeline {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Pipeline{log: log, relay: relay, now: time.Now}
+	return &Pipeline{log: log, relay: relay, now: time.Now, afterFunc: time.AfterFunc}
 }
 
 func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, recvKM core.SrtpKeyingMaterial) error {
@@ -105,6 +110,7 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 		p.callID = callID
 	}
 	p.srtp = srtp
+	p.outboundEpoch++
 	// Setup pode repetir com os mesmos masters: não reutilizar índice/IV nem
 	// apagar a janela de replay SRTCP dessa chamada.
 	srtcp.PreserveUnchangedKeys(p.srtcp)
@@ -159,6 +165,14 @@ func buildWhatsappVideoExt(mediaFrameInfo uint8, frameNumber *uint16, transportS
 }
 
 func (p *Pipeline) FeedCaptured(au []byte) {
+	p.mu.Lock()
+	at := p.now()
+	p.mu.Unlock()
+	p.FeedCapturedAt(au, at)
+}
+
+// at é a chegada ao motor; inclui espera pelos locks de bridge/packetização.
+func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 	p.sendMu.Lock()
 	defer p.sendMu.Unlock()
 	p.mu.Lock()
@@ -184,31 +198,28 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	}
 	idr := hasIDR(nalus)
 	now := p.now()
-	// Após um drop, repete KF enquanto espera IDR, no máximo uma vez por segundo.
-	if p.relay.BufferedAmount() > congestionDropBytes {
-		if p.envelopeCapable {
-			if !p.keyframeRequired || p.idrWaitAt.IsZero() {
-				p.idrWaitAt = now
-			}
-			p.keyframeRequired = true
-			requestKeyframe = p.requestKeyframeLocked(now)
-		}
+	if now.Sub(at) >= transport.VideoMaxAge {
+		p.keyframeRequired = true
+		requestKeyframe = p.requestKeyframeLocked(now)
+		p.log.Info("video outbound capture stale", "age_ms", now.Sub(at).Milliseconds())
 		return
 	}
-	// Aguarda o IDR inicial ou a recuperação Q1, com teto de dois segundos.
+	// Após um drop, repete KF enquanto espera IDR, no máximo uma vez por segundo.
+	if p.relay.BufferedAmount() > congestionDropBytes {
+		if !p.keyframeRequired || p.idrWaitAt.IsZero() {
+			p.idrWaitAt = now
+		}
+		p.keyframeRequired = true
+		requestKeyframe = p.requestKeyframeLocked(now)
+		return
+	}
+	// Nunca envia delta dependente de uma AU descartada, mesmo após dois segundos.
 	if p.keyframeRequired && !idr {
 		if p.idrWaitAt.IsZero() {
 			p.idrWaitAt = now
 		}
-		if now.Sub(p.idrWaitAt) < 2*time.Second {
-			if p.envelopeCapable {
-				requestKeyframe = p.requestKeyframeLocked(now)
-			}
-			return
-		}
-		p.log.Info("video outbound IDR wait expired", "idr_wait_ms", now.Sub(p.idrWaitAt).Milliseconds())
-		p.keyframeRequired = false
-		p.idrWaitAt = time.Time{}
+		requestKeyframe = p.requestKeyframeLocked(now)
+		return
 	}
 	// Junta TODOS os NALUs (menos AUD tipo 9) num único access unit Annex-B e fragmenta
 	// como UM NAL — é assim que o WhatsApp manda o vídeo (não NALU a NALU).
@@ -263,14 +274,51 @@ func (p *Pipeline) FeedCaptured(au []byte) {
 	if idr {
 		p.keyframeRequired = false
 		p.idrWaitAt = time.Time{}
+		p.outboundIDR++
 	}
 	relay := p.relay
+	epoch := p.outboundEpoch
+	idrGeneration := p.outboundIDR
 	p.mu.Unlock()
 	locked = false
+	protectedAU := make([][]byte, 0, len(packets))
 	for _, pkt := range packets {
-		if protected, err := srtp.Protect(pkt); err == nil {
-			relay.Broadcast(protected)
+		protected, err := srtp.Protect(pkt)
+		if err != nil {
+			p.outboundDropped(epoch, idrGeneration)
+			return
 		}
+		protectedAU = append(protectedAU, protected)
+	}
+	if sender, ok := relay.(interface {
+		BroadcastVideoAU([][]byte, bool, time.Time, func() bool, func())
+	}); ok {
+		sender.BroadcastVideoAU(protectedAU, idr, at, func() bool {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			return p.outboundEpoch == epoch && p.rtp != nil
+		}, func() { p.outboundDropped(epoch, idrGeneration) })
+	} else {
+		for _, packet := range protectedAU {
+			relay.Broadcast(packet)
+		}
+	}
+}
+
+func (p *Pipeline) outboundDropped(epoch, idrGeneration uint64) {
+	p.mu.Lock()
+	if p.outboundEpoch != epoch || p.rtp == nil {
+		p.mu.Unlock()
+		return
+	}
+	// Um relay lento não invalida um IDR mais novo já recebido do browser.
+	if p.outboundIDR == idrGeneration {
+		p.keyframeRequired = true
+	}
+	request := p.requestKeyframeLocked(p.now())
+	p.mu.Unlock()
+	if request != nil {
+		request()
 	}
 }
 
@@ -279,6 +327,7 @@ func (p *Pipeline) requestKeyframeLocked(now time.Time) func() {
 		return nil
 	}
 	p.lastKFAt = now
+	p.log.Debug("video browser keyframe requested", "call_id", p.callID)
 	return p.OnKeyframeRequired
 }
 
@@ -330,6 +379,8 @@ func (p *Pipeline) Reset() {
 }
 
 func (p *Pipeline) resetLocked() {
+	p.outboundEpoch++
+	p.outboundIDR = 0
 	p.rtp = nil
 	p.srtp = nil
 	p.srtcp = nil
@@ -351,6 +402,7 @@ func (p *Pipeline) resetLocked() {
 	p.stopReceiveTimerLocked()
 	p.reorder = videoReorder{}
 	p.lastPeerKFAt = time.Time{}
+	p.peerPLICount = 0
 	p.rtcpSeen = nil
 	p.receiveSPS, p.receivePPS = nil, nil
 }
@@ -408,5 +460,7 @@ func (p *Pipeline) DisableEnvelope() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.envelopeCapable = false
+	p.outboundEpoch++ // cancela vídeo pendente da bridge substituída
+	p.keyframeRequired = true
 	p.idrWaitAt = time.Time{}
 }

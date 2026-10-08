@@ -65,6 +65,43 @@ func TestSrtcpVideoPLIKnownVectorAndReplay(t *testing.T) {
 	}
 }
 
+func TestVideoCompoundBytesAndIndependentSrtcpVector(t *testing.T) {
+	plain := BuildVideoKeyframeRequest(0x55667788, 0xaabbccdd)
+	wantPlain, _ := hex.DecodeString("90c900015566778891ca0007556677880112353536363740706a3636373738382e6f72670000000091ce000255667788aabbccdd")
+	if !bytes.Equal(plain, wantPlain) {
+		t.Fatalf("RR+SDES+PLI=%x", plain)
+	}
+	infos, ok := ParseRTCP(plain, 0xaabbccdd)
+	if !ok || len(infos) != 3 || infos[0].Type != 201 || infos[1].Type != 202 || !infos[2].RequestsKeyframe {
+		t.Fatalf("compound=%v valid=%v", infos, ok)
+	}
+	// AES-CTR e HMAC-SHA1 calculados independentemente com Python cryptography:
+	// labels 3/4/5, sender do RR em claro, compound inteiro após byte 8 cifrado.
+	want, _ := hex.DecodeString("90c900015566778850b3642f4a1c78465d86b8464fb333eaf7eeafa23acac68912e34956cec9f3932ac009e58628c84a89e8377f80000001255cc6264922b27d2f1f")
+	s, err := NewSrtcpSession(rtcpTestKeys(), rtcpTestKeys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := s.Protect(plain)
+	if err != nil || !bytes.Equal(packet, want) {
+		t.Fatalf("SRTCP=%x err=%v", packet, err)
+	}
+	for _, i := range []int{0, 4, 8, 16, len(packet) - 14, len(packet) - 1} {
+		bad := bytes.Clone(packet)
+		bad[i] ^= 1
+		if _, err := s.Unprotect(bad); err == nil {
+			t.Fatalf("aceitou byte adulterado %d", i)
+		}
+	}
+	got, err := s.Unprotect(packet)
+	if err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("roundtrip=%x err=%v", got, err)
+	}
+	if _, err := s.Unprotect(packet); err == nil {
+		t.Fatal("compound replay aceito")
+	}
+}
+
 func TestSrtcpReorderedIndicesAndUnencryptedRTCP(t *testing.T) {
 	k := rtcpTestKeys()
 	s, _ := NewSrtcpSession(k, k)
