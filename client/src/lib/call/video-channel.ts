@@ -39,21 +39,38 @@ const buildVideoChannel = (pc: RTCPeerConnection): VideoChannel => {
     maxRetransmits: 0,
   });
   videoDc.binaryType = "arraybuffer";
-  videoDc.onmessage = (e: MessageEvent<ArrayBuffer>) => receiver.decode(e.data);
 
   let sender: VideoSender | null = null;
   let pending: MediaStreamTrack | null = null;
   let open = false;
+  let targetBitrate: number | null = null;
+
+  videoDc.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
+    if (typeof e.data === "string") {
+      if (e.data === "KF") sender?.requestKeyframe();
+      else if (/^B1 \d+$/.test(e.data)) {
+        const bps = Number(e.data.slice(3));
+        if (Number.isSafeInteger(bps) && bps >= 0) {
+          targetBitrate = bps;
+          sender?.setTargetBitrate(bps);
+        }
+      }
+      return;
+    }
+    receiver.decode(e.data);
+  };
 
   const startNow = (track: MediaStreamTrack) => {
     sender?.close();
     sender = new VideoSender(track, (au) => {
       if (videoDc.readyState === "open") videoDc.send(au);
     });
+    if (targetBitrate !== null) sender.setTargetBitrate(targetBitrate);
   };
 
   videoDc.onopen = () => {
     open = true;
+    videoDc.send("B1");
     if (pending) {
       startNow(pending);
       pending = null;

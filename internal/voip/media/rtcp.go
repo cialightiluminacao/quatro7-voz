@@ -42,6 +42,10 @@ func BuildVideoKeyframeRequest(sender, peer uint32) []byte {
 type RTCPInfo struct {
 	Type, Format     uint8
 	RequestsKeyframe bool
+	REMB             bool
+	REMBBitrate      uint64
+	REMBForVideo     bool
+	REMBSSRCs        []uint32
 }
 
 // ParseRTCP valida os limites de TODO o compound e o feedback de chave antes de
@@ -86,10 +90,47 @@ func ParseRTCP(data []byte, localVideo uint32) ([]RTCPInfo, bool) {
 						info.RequestsKeyframe = true
 					}
 				}
+			case 15:
+				// AFB não implica REMB. Só interpreta o identificador e a lista
+				// completos; audio REMB não pode limitar o encoder de vídeo.
+				if len(packet) >= 16 && string(packet[12:16]) == "REMB" {
+					if len(packet) < 20 || packet[16] == 0 || len(packet) != 20+4*int(packet[16]) {
+						return nil, false
+					}
+					exponent := uint(packet[17] >> 2)
+					mantissa := uint64(packet[17]&3)<<16 | uint64(packet[18])<<8 | uint64(packet[19])
+					if mantissa > ^uint64(0)>>exponent {
+						return nil, false
+					}
+					info.REMB, info.REMBBitrate = true, mantissa<<exponent
+					for list := packet[20:]; len(list) > 0; list = list[4:] {
+						ssrc := binary.BigEndian.Uint32(list[:4])
+						info.REMBSSRCs = append(info.REMBSSRCs, ssrc)
+						if localVideo != 0 && ssrc == localVideo {
+							info.REMBForVideo = true
+						}
+					}
+				}
 			}
 		}
 		out = append(out, info)
 		data = data[n:]
 	}
 	return out, len(out) > 0
+}
+
+// SR+SDES de vídeo, perfil WhatsApp, igual ao meowcaller rtp/rtcp.go:265-346.
+// packets/octets contam RTP admitido ao transporte (sem duplicar relays).
+func BuildVideoSenderReport(sender, timestamp, packets, octets uint32, nowMs int64) []byte {
+	sr := make([]byte, 28)
+	sr[0], sr[1], sr[3] = 0x90, 200, 6
+	binary.BigEndian.PutUint32(sr[4:8], sender)
+	binary.BigEndian.PutUint32(sr[8:12], uint32(nowMs/1000+2208988800))
+	binary.BigEndian.PutUint32(sr[12:16], uint32(uint64(nowMs%1000)*(1<<32)/1000))
+	binary.BigEndian.PutUint32(sr[16:20], timestamp)
+	binary.BigEndian.PutUint32(sr[20:24], packets)
+	binary.BigEndian.PutUint32(sr[24:28], octets)
+	// Reusa o mesmo CNAME de RR+SDES+PLI, sem incluir RR ou PLI no SR.
+	compound := BuildVideoKeyframeRequest(sender, 0)
+	return append(sr, compound[8:len(compound)-12]...)
 }

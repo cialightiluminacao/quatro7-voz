@@ -87,7 +87,9 @@ type CallManager struct {
 	OnPeerAudio            func([]float32)
 	OnPeerAudioReset       func() // retomada: descarta PCM antigo no playout
 	OnPeerVideo            func([]byte)
-	OnVideoKeyframeRequest func() // enviar texto KF ao browser; rate limit no pipeline
+	OnVideoKeyframeRequest func()       // enviar texto KF ao browser; rate limit no pipeline
+	OnVideoBitrateRequest  func(uint64) // REMB autenticado para o vídeo local
+	OnVideoDiagnostics     func(string) // amostra INFO da ponte, uma vez a cada 5 s
 
 	OnVideoUpgradeRequest func(*CallInfo) // o peer pediu um upgrade p/ vídeo
 	OnVideoStateChanged   func(*CallInfo) // qualquer mudança no estado de vídeo
@@ -112,6 +114,16 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 	m.video.OnKeyframeRequired = func() {
 		if m.OnVideoKeyframeRequest != nil {
 			m.OnVideoKeyframeRequest()
+		}
+	}
+	m.video.OnBitrateRequired = func(bps uint64) {
+		if m.OnVideoBitrateRequest != nil {
+			m.OnVideoBitrateRequest(bps)
+		}
+	}
+	m.video.OnDiagnostics = func(callID string) {
+		if m.OnVideoDiagnostics != nil {
+			m.OnVideoDiagnostics(callID)
 		}
 	}
 	m.video.OnFrame = func(au []byte) {

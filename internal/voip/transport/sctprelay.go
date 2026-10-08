@@ -86,8 +86,9 @@ type SctpRelayManager struct {
 
 	onConnected func(ip string, port int)
 
-	onReceive  func(data []byte)
-	sendErrors atomic.Int64 // somente envios de mídia via Broadcast
+	onReceive   func(data []byte)
+	videoCallID string
+	sendErrors  atomic.Int64 // somente envios de mídia via Broadcast
 }
 
 func NewSctpRelayManager(log *slog.Logger) *SctpRelayManager {
@@ -112,6 +113,12 @@ func (m *SctpRelayManager) SetStreamSsrcs(selfSsrcs, peerSsrcs []uint32) {
 func (m *SctpRelayManager) SetOnConnected(fn func(ip string, port int)) { m.onConnected = fn }
 
 func (m *SctpRelayManager) SetOnReceive(fn func(data []byte)) { m.onReceive = fn }
+
+func (m *SctpRelayManager) SetVideoCallID(callID string) {
+	m.mu.Lock()
+	m.videoCallID = callID
+	m.mu.Unlock()
+}
 
 func (m *SctpRelayManager) ResendSubscriptions() {
 	m.mu.Lock()
@@ -214,6 +221,7 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 		}
 		conn.state = relayStateOpen
 		conn.sender = newRelayMediaSender(channel, m.log, id, conn.stopCh, func() { m.sendErrors.Add(1) })
+		conn.sender.callID = m.videoCallID
 		go conn.sender.run()
 		m.mu.Unlock()
 		m.log.Info("relay datachannel open", "id", id)
@@ -225,6 +233,12 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 	})
 	channel.OnClose(func() { m.closeConnection(id) })
 	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
+		m.mu.Lock()
+		sender := conn.sender
+		m.mu.Unlock()
+		if sender != nil {
+			sender.observeReceive(msg.Data, time.Now())
+		}
 		if m.onReceive != nil {
 			m.onReceive(msg.Data)
 		}
@@ -479,6 +493,28 @@ func (m *SctpRelayManager) Broadcast(data []byte) {
 }
 
 func (m *SctpRelayManager) DrainSendErrors() int64 { return m.sendErrors.Swap(0) }
+
+// Conta admissão real pelo DataChannel.Send por destino; Broadcast sem retorno
+// não permite distinguir pedido construído de PLI efetivamente enviado.
+func (m *SctpRelayManager) BroadcastRTCP(data []byte) int {
+	m.mu.Lock()
+	var senders []*relayMediaSender
+	for _, c := range m.connections {
+		if c.state == relayStateOpen && c.sender != nil {
+			senders = append(senders, c.sender)
+		}
+	}
+	m.mu.Unlock()
+	sent := 0
+	for _, sender := range senders {
+		if err := sender.sendPriority(data); err == nil {
+			sent++
+		} else {
+			m.sendErrors.Add(1)
+		}
+	}
+	return sent
+}
 
 func (m *SctpRelayManager) countOpenLocked() int {
 	n := 0

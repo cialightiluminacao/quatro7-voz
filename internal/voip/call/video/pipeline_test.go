@@ -60,8 +60,11 @@ func manualVideoClock(p *Pipeline, now *time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stopReceiveTimerLocked()
+	p.stopMonitorLocked()
 	p.now = func() time.Time { return *now }
 	p.afterFunc = func(time.Duration, func()) *time.Timer { return time.NewTimer(24 * time.Hour) }
+	p.diag.lastLog = time.Time{}
+	p.startMonitorLocked()
 	if p.receive.needIDR {
 		p.receive.idrWaitAt = *now
 	}

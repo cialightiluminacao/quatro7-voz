@@ -34,21 +34,22 @@ type Pipeline struct {
 	log   *slog.Logger
 	relay Relay
 
-	sendMu     sync.Mutex // serializa packetização e SRTP de envio fora de mu
-	mu         sync.Mutex
-	receiveMu  sync.Mutex // serializa recepção e callbacks; nunca adquirido sob mu
-	rtp        *media.RtpSession
-	srtp       *media.SrtpSession
-	srtcp      *media.SrtcpSession
-	selfSsrc   uint32
-	depack     *transport.H264Depacketizer
-	frameBuf   []byte
-	firstAUAt  time.Time
-	clockTicks uint32
-	now        func() time.Time
-	afterFunc  func(time.Duration, func()) *time.Timer
-	lastKFAt   time.Time
-	idrWaitAt  time.Time
+	sendMu        sync.Mutex // serializa packetização e SRTP de envio fora de mu
+	mu            sync.Mutex
+	receiveMu     sync.Mutex // serializa recepção e callbacks; nunca adquirido sob mu
+	rtp           *media.RtpSession
+	srtp          *media.SrtpSession
+	srtcp         *media.SrtcpSession
+	selfSsrc      uint32
+	selfAudioSsrc uint32
+	depack        *transport.H264Depacketizer
+	frameBuf      []byte
+	firstAUAt     time.Time
+	clockTicks    uint32
+	now           func() time.Time
+	afterFunc     func(time.Duration, func()) *time.Timer
+	lastKFAt      time.Time
+	idrWaitAt     time.Time
 
 	callID                 string
 	envelopeCapable        bool
@@ -64,6 +65,9 @@ type Pipeline struct {
 	outboundEpoch          uint64
 	outboundIDR            uint64
 	rtcpSeen               map[uint16]bool
+	diag                   videoDiagnostics
+	monitorTimer           *time.Timer
+	monitorEpoch           uint64
 	// Guard estável do CallManager: timers e pacotes compartilham o lock da
 	// troca de bridge. Adquirido antes de receiveMu e mu.
 	ReceiveGuard *sync.Mutex
@@ -77,6 +81,9 @@ type Pipeline struct {
 	// Callbacks rodam sem mu; Setup/Reset podem ser chamados com o lock da call.
 	OnOrientation      func(callID string, orientation int)
 	OnKeyframeRequired func()
+	// REMB autenticado que lista explicitamente o SSRC de vídeo local.
+	OnBitrateRequired func(uint64)
+	OnDiagnostics     func(string)
 }
 
 func New(log *slog.Logger, relay Relay) *Pipeline {
@@ -116,9 +123,10 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 	srtcp.PreserveUnchangedKeys(p.srtcp)
 	p.srtcp = srtcp
 	p.selfSsrc = selfSsrc
+	p.selfAudioSsrc = media.GenerateSecureSsrc(callID, ourDeviceJid, 0)
 	p.rtp = media.NewH264Session(selfSsrc)
 	p.depack = &transport.H264Depacketizer{}
-	p.receive = receiveState{auSequence: p.receive.auSequence, needIDR: true, idrWaitAt: p.now()}
+	p.receive = receiveState{auSequence: p.receive.auSequence, needIDR: true}
 	p.stopReceiveTimerLocked()
 	p.reorder = videoReorder{}
 	p.frameBuf = nil
@@ -127,8 +135,18 @@ func (p *Pipeline) Setup(callID, ourDeviceJid, peerDeviceJid string, sendKM, rec
 	p.keyframeRequired = true
 	p.firstAUAt = time.Time{}
 	p.clockTicks = 0
+	// Os contadores de RTP do SR seguem o novo stream; totais de diagnóstico
+	// continuam pertencendo à chamada, inclusive depois de um rekey.
+	p.diag.srPackets, p.diag.srOctets = 0, 0
+	p.diag.srAt = time.Time{}
+	// A ausência de RTP/RTCP também precisa aparecer em INFO. Iniciar apenas
+	// no primeiro pacote tornaria uma chamada sem mídia invisível ao monitor.
+	p.startMonitorLocked()
 	p.mu.Unlock()
 
+	if relay, ok := p.relay.(interface{ SetVideoCallID(string) }); ok {
+		relay.SetVideoCallID(callID)
+	}
 	p.relay.SetStreamSsrcs(selfSsrcs, peerSsrcs)
 	p.log.Debug("video media set up", "self_video_ssrc", selfSsrc,
 		"stream_ssrcs", len(selfSsrcs)+len(peerSsrcs))
@@ -177,6 +195,9 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 	defer p.sendMu.Unlock()
 	p.mu.Lock()
 	locked := true
+	p.diag.txAUs++
+	p.diag.lastCapture = p.now()
+	p.startMonitorLocked()
 	var requestKeyframe func()
 	defer func() {
 		if locked {
@@ -190,22 +211,25 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 	frameNum := p.frameNumber
 	tseq := p.transportSeq
 	if rtp == nil || srtp == nil || !p.relay.HasConnection() || len(au) == 0 {
+		countReason(&p.diag.txDrops, "not-ready-or-empty")
 		return
 	}
 	nalus := transport.SplitAnnexB(au)
 	if len(nalus) == 0 {
+		countReason(&p.diag.txDrops, "invalid-annexb")
 		return
 	}
 	idr := hasIDR(nalus)
 	now := p.now()
 	if now.Sub(at) >= transport.VideoMaxAge {
+		countReason(&p.diag.txDrops, "capture-age")
 		p.keyframeRequired = true
 		requestKeyframe = p.requestKeyframeLocked(now)
-		p.log.Info("video outbound capture stale", "age_ms", now.Sub(at).Milliseconds())
 		return
 	}
 	// Após um drop, repete KF enquanto espera IDR, no máximo uma vez por segundo.
 	if p.relay.BufferedAmount() > congestionDropBytes {
+		countReason(&p.diag.txDrops, "sctp-buffer")
 		if !p.keyframeRequired || p.idrWaitAt.IsZero() {
 			p.idrWaitAt = now
 		}
@@ -215,6 +239,7 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 	}
 	// Nunca envia delta dependente de uma AU descartada, mesmo após dois segundos.
 	if p.keyframeRequired && !idr {
+		countReason(&p.diag.txDrops, "waiting-idr")
 		if p.idrWaitAt.IsZero() {
 			p.idrWaitAt = now
 		}
@@ -234,6 +259,7 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		packed = append(packed, n...)
 	}
 	if len(packed) == 0 {
+		countReason(&p.diag.txDrops, "empty-payload")
 		return
 	}
 	if p.firstAUAt.IsZero() {
@@ -285,11 +311,35 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 	for _, pkt := range packets {
 		protected, err := srtp.Protect(pkt)
 		if err != nil {
+			p.mu.Lock()
+			countReason(&p.diag.txDrops, "srtp-protect")
+			p.mu.Unlock()
 			p.outboundDropped(epoch, idrGeneration)
 			return
 		}
 		protectedAU = append(protectedAU, protected)
 	}
+	p.mu.Lock()
+	if p.outboundEpoch != epoch || p.rtp == nil {
+		p.mu.Unlock()
+		return
+	}
+	p.diag.txSubmitted++
+	p.diag.txBytes += uint64(len(au))
+	firstRTP := p.diag.srPackets == 0
+	for _, pkt := range packets {
+		p.diag.srPackets++
+		p.diag.srOctets += uint32(len(pkt.Payload))
+		p.diag.srTimestamp = pkt.Header.Timestamp
+	}
+	p.diag.srRtpAt = now
+	// Um monitor que começou só para recepção pode estar aguardando 5 s.
+	// Reagenda para começar os SR de envio em 1,5 s.
+	if firstRTP {
+		p.stopMonitorLocked()
+		p.startMonitorLocked()
+	}
+	p.mu.Unlock()
 	if sender, ok := relay.(interface {
 		BroadcastVideoAU([][]byte, bool, time.Time, func() bool, func())
 	}); ok {
@@ -327,6 +377,7 @@ func (p *Pipeline) requestKeyframeLocked(now time.Time) func() {
 		return nil
 	}
 	p.lastKFAt = now
+	p.diag.browserKF++
 	p.log.Debug("video browser keyframe requested", "call_id", p.callID)
 	return p.OnKeyframeRequired
 }
@@ -344,6 +395,8 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 	unlock := p.lockReceive()
 	defer unlock()
 	p.mu.Lock()
+	p.diag.rxPackets++
+	p.startMonitorLocked()
 	if p.srtp == nil || p.depack == nil || len(data) < 12 {
 		p.mu.Unlock()
 		return
@@ -355,10 +408,12 @@ func (p *Pipeline) HandleRelayData(data []byte) {
 
 	pkt, err := p.srtp.Unprotect(data)
 	if err != nil {
+		p.diag.rxAuthRejected++
 		p.mu.Unlock()
 		p.log.Debug("video srtp unprotect error", "err", err)
 		return
 	}
+	p.diag.lastPacket = p.now()
 	accepted, restarted := p.reorder.push(pkt, p.now())
 	if restarted {
 		p.discardReceiveAULocked("sequence-restart")
@@ -385,6 +440,7 @@ func (p *Pipeline) resetLocked() {
 	p.srtp = nil
 	p.srtcp = nil
 	p.selfSsrc = 0
+	p.selfAudioSsrc = 0
 	p.depack = nil
 	p.frameBuf = nil
 	p.firstAUAt = time.Time{}
@@ -405,6 +461,8 @@ func (p *Pipeline) resetLocked() {
 	p.peerPLICount = 0
 	p.rtcpSeen = nil
 	p.receiveSPS, p.receivePPS = nil, nil
+	p.stopMonitorLocked()
+	p.diag = videoDiagnostics{}
 }
 
 // BeginCall limpa metadados antes de Setup (Q1/stanza podem chegar antes das chaves).

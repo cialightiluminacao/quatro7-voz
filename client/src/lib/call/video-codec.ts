@@ -19,6 +19,8 @@ export class VideoSender {
   private reader: ReadableStreamDefaultReader<VideoFrame>;
   private frameCount = 0;
   private closed = false;
+  private forceKeyframe = true;
+  private targetBitrate = VIDEO_BITRATE;
 
   constructor(track: MediaStreamTrack, send: (au: ArrayBuffer) => void) {
     this.encoder = new VideoEncoder({
@@ -29,27 +31,45 @@ export class VideoSender {
       },
       error: (e) => console.error("video encoder error", e),
     });
+    this.configure();
+    const processor = new MediaStreamTrackProcessor({ track });
+    this.reader = processor.readable.getReader();
+    void this.pump();
+  }
+
+  private configure(): void {
     this.encoder.configure({
       codec: VIDEO_CODEC,
       width: VIDEO_WIDTH,
       height: VIDEO_HEIGHT,
-      bitrate: VIDEO_BITRATE,
+      bitrate: this.targetBitrate,
       framerate: VIDEO_FPS,
       latencyMode: "realtime",
       avc: { format: "annexb" },
     });
-    const processor = new MediaStreamTrackProcessor({ track });
-    this.reader = processor.readable.getReader();
-    void this.pump();
+  }
+
+  requestKeyframe(): void {
+    this.forceKeyframe = true;
+  }
+
+  setTargetBitrate(bps: number): void {
+    if (this.closed || !Number.isSafeInteger(bps) || bps < 0) return;
+    const target = Math.min(bps, VIDEO_BITRATE);
+    if (target === this.targetBitrate) return;
+    this.targetBitrate = target;
+    if (target > 0) this.configure();
+    this.requestKeyframe();
   }
 
   private async pump(): Promise<void> {
     while (!this.closed) {
       const { value: frame, done } = await this.reader.read();
       if (done || !frame) break;
-      if (this.encoder.encodeQueueSize < 2) {
-        const keyFrame = this.frameCount % VIDEO_KEYFRAME_INTERVAL === 0;
+      if (this.targetBitrate > 0 && this.encoder.encodeQueueSize < 2) {
+        const keyFrame = this.forceKeyframe || this.frameCount % VIDEO_KEYFRAME_INTERVAL === 0;
         this.encoder.encode(frame, { keyFrame });
+        this.forceKeyframe = false;
         this.frameCount += 1;
       }
       frame.close();

@@ -60,6 +60,8 @@ type receiveState struct {
 
 func (p *Pipeline) discardReceiveAULocked(reason string) {
 	if !p.receive.damaged {
+		countReason(&p.diag.rxDrops, reason)
+		p.diag.lastReason = reason
 		p.log.Debug("video receive AU discarded", "reason", reason, "ssrc", p.receive.ssrc, "seq", p.receive.lastSeq, "timestamp", p.receive.timestamp,
 			"duplicates", p.reorder.duplicates, "reordered", p.reorder.reordered, "late", p.reorder.late, "missing", p.reorder.missing)
 	}
@@ -74,6 +76,10 @@ func (p *Pipeline) discardReceiveAULocked(reason string) {
 func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	r, h := &p.receive, pkt.Header
 	if r.seqKnown && r.ssrc != h.Ssrc {
+		p.diag.rxSsrcChanges++
+		if r.active {
+			p.discardReceiveAULocked("ssrc-switch")
+		}
 		// Outro stream não pode completar o FU-A do anterior.
 		*r = receiveState{auSequence: r.auSequence, needIDR: true, idrWaitAt: p.now()}
 		p.receiveSPS, p.receivePPS = nil, nil
@@ -86,6 +92,7 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 			return nil, false // duplicatas/atrasados nunca danificam a AU
 		}
 		if distance != 1 {
+			p.diag.lastReason = "sequence-gap"
 			p.log.Debug("video receive sequence gap", "missing", uint16(distance-1), "duplicates", p.reorder.duplicates, "reordered", p.reorder.reordered, "late", p.reorder.late)
 			p.requireReceiveIDRLocked()
 			if r.active && h.Timestamp == r.timestamp {
@@ -94,6 +101,9 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 		}
 	}
 	r.ssrc, r.lastSeq, r.seqKnown = h.Ssrc, h.SequenceNumber, true
+	if r.needIDR && r.idrWaitAt.IsZero() {
+		r.idrWaitAt = p.now()
+	}
 	if !r.haveTimestamp || h.Timestamp != r.timestamp {
 		if r.active {
 			p.discardReceiveAULocked("timestamp-before-marker") // marker/fim do FU-A perdido
@@ -105,6 +115,7 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 		r.auBytes = 0
 		r.orientation, r.hasOrientation = p.peerOrientation, false
 		r.auSequence++
+		p.diag.rxAUs++
 	} else if !r.active {
 		return nil, false // pacote depois do marker da mesma AU
 	}
@@ -143,8 +154,12 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	au := p.frameBuf
 	p.frameBuf = nil
 	if r.damaged || len(au) == 0 {
+		if !r.damaged {
+			countReason(&p.diag.rxDrops, "empty-au")
+		}
 		return nil, changed
 	}
+	p.diag.rxComplete++
 	// WhatsApp pode fragmentar vários NALUs Annex-B como um único FU-A.
 	nalus := transport.SplitAnnexB(au)
 	idr := hasIDR(nalus)
@@ -179,18 +194,21 @@ func (p *Pipeline) receivePacketLocked(pkt *media.RtpPacket) ([]byte, bool) {
 	}
 	if r.needIDR && !idr {
 		if p.now().Sub(r.idrWaitAt) < 2*time.Second {
+			countReason(&p.diag.rxDrops, "waiting-idr")
 			return nil, changed
 		}
 		if !r.idrWaitExpired {
-			p.log.Info("video receive IDR wait expired", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
+			p.log.Info("video receive IDR wait expired", "call_id", p.callID, "peer_ssrc", r.ssrc, "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
 			r.idrWaitExpired = true
 		}
 		// AU completa continua delta. Mantém pedidos até IDR real; expirar a
 		// espera não restaura referências de um decoder reiniciado no painel.
+		p.diag.rxDeltaWhileWaiting++
 	}
 	if idr {
+		p.diag.rxIDRs++
 		if r.needIDR {
-			p.log.Info("video receive IDR recovered", "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
+			p.log.Info("video receive IDR recovered", "call_id", p.callID, "peer_ssrc", r.ssrc, "idr_wait_ms", p.now().Sub(r.idrWaitAt).Milliseconds())
 		}
 		r.needIDR = false
 		r.idrWaitAt = time.Time{}
@@ -254,7 +272,11 @@ func (r *receiveState) validPayload(payload []byte) bool {
 
 func (p *Pipeline) requireReceiveIDRLocked() {
 	if !p.receive.needIDR || p.receive.idrWaitAt.IsZero() {
-		p.receive.idrWaitAt = p.now()
+		// KF pode chegar antes de o peer ligar a câmera. A espera medida
+		// começa com RTP conhecido, não com a fase de áudio da chamada.
+		if p.receive.seqKnown {
+			p.receive.idrWaitAt = p.now()
+		}
 		p.receive.idrWaitExpired = false
 	}
 	p.receive.needIDR = true

@@ -83,12 +83,19 @@ func getBrowserAPI(log *slog.Logger) *webrtc.API {
 const h264ChannelLabel = "h264"
 
 type Bridge struct {
-	pc         *webrtc.PeerConnection
-	localTrack *webrtc.TrackLocalStaticSample
-	videoDC    atomic.Pointer[webrtc.DataChannel]
-	log        *slog.Logger
-	callID     string
-	mediaEpoch atomic.Uint64
+	pc              *webrtc.PeerConnection
+	localTrack      *webrtc.TrackLocalStaticSample
+	videoDC         atomic.Pointer[webrtc.DataChannel]
+	log             *slog.Logger
+	callID          string
+	mediaEpoch      atomic.Uint64
+	videoStats      bridgeVideoDiagnostics
+	videoControlMu  sync.Mutex
+	bitrateCapable  bool
+	bitrateKnown    bool
+	targetBitrate   uint64
+	lastBitrateAt   time.Time
+	lastBitrateSent uint64
 
 	OnBrowserRTP func(payload []byte)
 	// OnBrowserVideo is invoked with H264 access units captured from the browser camera.
@@ -155,6 +162,9 @@ func newBridgeWithAPI(offerSDP string, log *slog.Logger, api *webrtc.API) (*Brid
 			return
 		}
 		br.videoDC.Store(dc)
+		dc.OnOpen(func() {
+			log.Info("video browser channel open", "call_id", br.callID, "ordered", dc.Ordered(), "max_retransmits", dc.MaxRetransmits())
+		})
 		dc.OnMessage(br.handleVideoMessage)
 	})
 
@@ -194,25 +204,41 @@ func (b *Bridge) handleVideoMessage(msg webrtc.DataChannelMessage) {
 	if msg.IsString {
 		switch string(msg.Data) {
 		case "Q1":
+			b.videoStats.envelopeRequests.Add(1)
 			if b.OnVideoEnvelope != nil {
 				b.OnVideoEnvelope(b.callID)
 			}
 		case "KF":
+			b.videoStats.peerKFRequests.Add(1)
 			if b.OnPeerVideoKeyframe != nil {
 				b.OnPeerVideoKeyframe(b.callID)
 			}
+		case "B1":
+			b.videoControlMu.Lock()
+			b.bitrateCapable = true
+			b.sendVideoBitrateLocked()
+			b.videoControlMu.Unlock()
 		}
 		return
 	}
 	if b.OnBrowserVideo != nil && len(msg.Data) > 0 {
+		b.videoStats.captured.Add(1)
+		b.videoStats.captureBytes.Add(uint64(len(msg.Data)))
 		b.OnBrowserVideo(msg.Data)
 	}
 }
 
 func (b *Bridge) RequestVideoKeyframe() error {
 	if dc := b.videoDC.Load(); dc != nil {
-		return dc.SendText("KF")
+		err := dc.SendText("KF")
+		if err != nil {
+			b.videoStats.kfErrors.Add(1)
+		} else {
+			b.videoStats.kfSent.Add(1)
+		}
+		return err
 	}
+	b.videoStats.kfErrors.Add(1)
 	return nil
 }
 
@@ -224,11 +250,27 @@ func (b *Bridge) WriteOpus(payload []byte, dur time.Duration) error {
 }
 
 func (b *Bridge) WriteVideo(au []byte) error {
+	b.videoStats.received.Add(1)
 	dc := b.videoDC.Load()
 	if dc == nil || len(au) == 0 {
+		b.videoStats.noChannel.Add(1)
 		return nil
 	}
-	return dc.Send(au)
+	started := time.Now()
+	err := dc.Send(au)
+	duration := time.Since(started).Microseconds()
+	for old := b.videoStats.maxSendUS.Load(); duration > old; old = b.videoStats.maxSendUS.Load() {
+		if b.videoStats.maxSendUS.CompareAndSwap(old, duration) {
+			break
+		}
+	}
+	if err != nil {
+		b.videoStats.sendErrors.Add(1)
+	} else {
+		b.videoStats.sent.Add(1)
+		b.videoStats.sentBytes.Add(uint64(len(au)))
+	}
+	return err
 }
 
 func (b *Bridge) Close() {

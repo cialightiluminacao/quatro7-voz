@@ -186,6 +186,27 @@ func TestBridgeLargeVideoAndKeyframeDataChannel(t *testing.T) {
 	if !msg.IsString || string(msg.Data) != "KF" {
 		t.Fatalf("KF=%q texto=%v", msg.Data, msg.IsString)
 	}
+	// REMB não vira texto para um decoder legado. B1 opt-in recupera também
+	// o alvo recebido antes da negociação; zero continua sendo explícito.
+	b.SetVideoBitrate(750000)
+	if b.videoStats.bitrateSent.Load() != 0 {
+		t.Fatal("bitrate enviado sem B1")
+	}
+	if err = dc.SendText("B1"); err != nil {
+		t.Fatal(err)
+	}
+	msg = awaitVideoMessage(t, messages)
+	if !msg.IsString || string(msg.Data) != "B1 750000" {
+		t.Fatalf("B1=%q", msg.Data)
+	}
+	b.SetVideoBitrate(0)
+	msg = awaitVideoMessage(t, messages)
+	if !msg.IsString || string(msg.Data) != "B1 0" {
+		t.Fatalf("B1 zero=%q", msg.Data)
+	}
+	if b.videoStats.sent.Load() != 2 || b.videoStats.captured.Load() != 1 || b.videoStats.envelopeRequests.Load() != 1 || b.videoStats.bitrateSent.Load() != 2 {
+		t.Fatal("contadores da ponte perderam AU/controle")
+	}
 	select {
 	case <-negotiated:
 		t.Fatal("outro canal negociou Q1")

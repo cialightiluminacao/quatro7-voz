@@ -32,6 +32,14 @@ func (p *Pipeline) drainReceiveLocked(now time.Time) {
 		frame, changed := p.receivePacketLocked(pkt)
 		cb, orientationCB := p.OnFrame, p.OnOrientation
 		callID, orientation := p.callID, p.peerOrientation
+		if frame != nil {
+			if cb != nil {
+				p.diag.rxForwarded++
+				p.diag.lastFrame = p.now()
+			} else {
+				countReason(&p.diag.rxDrops, "no-frame-callback")
+			}
+		}
 		p.mu.Unlock()
 		if changed && orientationCB != nil {
 			orientationCB(callID, orientation)
@@ -105,19 +113,33 @@ func (p *Pipeline) sendPeerKeyframeLocked() {
 	plain := media.BuildVideoKeyframeRequest(p.selfSsrc, p.receive.ssrc)
 	packet, err := p.srtcp.Protect(plain)
 	if err != nil {
+		p.diag.pliErrors++
 		p.log.Debug("video keyframe request protection failed", "err", err)
 		return
 	}
 	p.lastPeerKFAt = now
 	p.peerPLICount++
+	sent := p.broadcastRTCPLocked(packet)
+	p.diag.pliSent += uint64(sent)
+	if sent == 0 {
+		p.diag.pliErrors++
+	}
 	if p.peerPLICount == 1 {
-		p.log.Debug("video first PLI", "call_id", p.callID, "count", p.peerPLICount,
+		p.log.Info("video first PLI", "call_id", p.callID, "count", p.peerPLICount,
+			"relay_sends", sent,
 			"sender_ssrc", p.selfSsrc, "peer_ssrc", p.receive.ssrc,
 			"compound_hex", hex.EncodeToString(plain), "srtcp_hex", hex.EncodeToString(packet),
 			"srtcp_index", binary.BigEndian.Uint32(packet[len(packet)-14:len(packet)-10])&0x7fffffff)
 	}
-	p.relay.Broadcast(packet)
 	p.log.Debug("video peer keyframe requested", "peer_ssrc", p.receive.ssrc, "count", p.peerPLICount)
+}
+
+func (p *Pipeline) broadcastRTCPLocked(packet []byte) int {
+	if relay, ok := p.relay.(interface{ BroadcastRTCP([]byte) int }); ok {
+		return relay.BroadcastRTCP(packet)
+	}
+	p.relay.Broadcast(packet)
+	return 1 // transport alternativo usado pelos testes, sem confirmação por destino
 }
 
 // KF do browser pede IDR do peer. Pode chegar antes do primeiro RTP autenticado;
@@ -129,6 +151,8 @@ func (p *Pipeline) RequestPeerKeyframe() {
 		return
 	}
 	p.requireReceiveIDRLocked()
+	p.diag.lastReason = "browser-kf"
+	p.diag.rxBrowserKF++
 	p.sendPeerKeyframeLocked()
 	p.scheduleReceiveLocked()
 }
@@ -142,17 +166,22 @@ func (p *Pipeline) HandleRTCP(data []byte) {
 		return
 	}
 	plain, err := p.srtcp.Unprotect(data)
+	p.startMonitorLocked()
 	if err != nil {
+		p.diag.rtcpRejected++
 		p.mu.Unlock()
 		p.log.Debug("peer srtcp rejected", "err", err)
 		return
 	}
 	infos, ok := media.ParseRTCP(plain, p.selfSsrc)
 	if !ok {
+		p.diag.rtcpMalformed++
 		p.mu.Unlock()
 		return
 	}
 	var request func()
+	var bitrate func(uint64)
+	var target uint64
 	for _, info := range infos {
 		if p.rtcpSeen == nil {
 			p.rtcpSeen = make(map[uint16]bool)
@@ -160,7 +189,32 @@ func (p *Pipeline) HandleRTCP(data []byte) {
 		kind := uint16(info.Type)<<8 | uint16(info.Format)
 		if !p.rtcpSeen[kind] {
 			p.rtcpSeen[kind] = true
-			p.log.Info("peer RTCP authenticated", "pt", info.Type, "fmt", info.Format, "requests_keyframe", info.RequestsKeyframe)
+			p.log.Info("peer RTCP authenticated", "call_id", p.callID, "pt", info.Type, "fmt", info.Format, "requests_keyframe", info.RequestsKeyframe,
+				"remb", info.REMB, "remb_bps", info.REMBBitrate, "remb_for_video", info.REMBForVideo)
+		}
+		if info.REMB {
+			p.diag.rembSeen, p.diag.rembVideo = true, info.REMBForVideo
+			p.diag.rembBitrate, p.diag.rembAt = info.REMBBitrate, p.now()
+			p.diag.rembCount++
+			p.diag.rembSSRCs = info.REMBSSRCs
+			if info.REMBForVideo {
+				p.diag.rembVideoBitrate = info.REMBBitrate
+				bitrate, target = p.OnBitrateRequired, info.REMBBitrate
+				// REMB cobre a SOMA dos streams listados. Reserva o bitrate
+				// configurado do MLow se o mesmo feedback inclui nosso áudio.
+				for _, ssrc := range info.REMBSSRCs {
+					if ssrc == p.selfAudioSsrc {
+						reserve := uint64(media.DefaultCodecOptions.Bitrate)
+						if target > reserve {
+							target -= reserve
+						} else {
+							target = 0
+						}
+						break
+					}
+				}
+				p.diag.rembEncoderBitrate = target
+			}
 		}
 		if info.RequestsKeyframe {
 			p.keyframeRequired = true
@@ -175,5 +229,8 @@ func (p *Pipeline) HandleRTCP(data []byte) {
 	p.mu.Unlock()
 	if request != nil {
 		request()
+	}
+	if bitrate != nil {
+		bitrate(target)
 	}
 }

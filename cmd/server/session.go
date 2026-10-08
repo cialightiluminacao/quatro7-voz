@@ -472,6 +472,21 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			_ = bridge.RequestVideoKeyframe()
 		}
 	}
+	cm.OnVideoBitrateRequest = func(bps uint64) {
+		if bridge, _, ok := s.reg.mediaOf(callID); ok && bridge != nil {
+			bridge.SetVideoBitrate(bps)
+		}
+	}
+	cm.OnVideoDiagnostics = func(sampleCallID string) {
+		if sampleCallID != callID {
+			return
+		}
+		if bridge, _, ok := s.reg.mediaOf(callID); ok && bridge != nil {
+			bridge.LogVideoDiagnostics()
+		} else {
+			s.log.Info("video browser bridge missing", "call_id", callID)
+		}
+	}
 	cm.OnVideoUpgradeRequest = func(c *call.CallInfo) {
 		s.mgr.broker.emitVideoState(s.id, c.CallID, "upgrade-request", c.StateData)
 	}
