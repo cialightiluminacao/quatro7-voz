@@ -165,8 +165,25 @@ func (m *CallManager) handleAudioRelayData(data []byte) {
 		m.mu.Unlock()
 		return
 	}
-	ssrc := media.RTPSsrc(data)
+	header, err := media.DecodeRtpHeader(data)
+	if err != nil {
+		m.mu.Unlock()
+		m.log.Debug("rtp header error", "err", err)
+		return
+	}
+	ssrc := header.Ssrc
 	if ssrc == m.selfSsrc {
+		m.mu.Unlock()
+		return
+	}
+	// Nenhum pacote sem autenticação pode alterar a fila, SSRC ou timeline.
+	pkt, err := m.srtpSession.Unprotect(data)
+	if err != nil {
+		m.mu.Unlock()
+		m.log.Debug("srtp unprotect error", "err", err)
+		return
+	}
+	if len(pkt.Payload) == 0 {
 		m.mu.Unlock()
 		return
 	}
@@ -178,37 +195,121 @@ func (m *CallManager) handleAudioRelayData(data []byte) {
 			go m.relay.ResendSubscriptions()
 		}
 	}
-	pkt, err := m.srtpSession.Unprotect(data)
-	if err != nil {
+	now := time.Now()
+	duplicate, late, resynced := m.audioReorder.push(pkt.Header, pkt.Payload, now)
+	if resynced {
+		m.audioTimelineSet = false
+		m.audioPlayedSamples = 0
+	}
+	if duplicate || late {
+		m.peerLateDrops.Add(1)
+		if duplicate {
+			m.peerDuplicates.Add(1)
+		}
 		m.mu.Unlock()
-		m.log.Debug("srtp unprotect error", "err", err)
 		return
 	}
-	if len(pkt.Payload) == 0 || m.peerAudioLateLocked(pkt.Header.Timestamp) {
-		m.mu.Unlock()
-		return
-	}
-	pcm, err := m.codec.Decode(pkt.Payload)
-	if err != nil || len(pcm) == 0 {
-		m.mu.Unlock()
-		return
-	}
-	// Mesmo em hold o decoder avança: registrar a timeline impede que o segundo
-	// relay decodifique de novo o mesmo pacote e mantém a retomada na posição atual.
-	pcm = m.alignPeerAudioLocked(pkt.Header.Timestamp, pcm)
-	if m.held {
-		m.mu.Unlock()
-		// Em espera: não encaminha o áudio do peer ao navegador do atendente.
-		return
-	}
+	pcm := m.drainPeerAudioLocked(now)
+	m.schedulePeerAudioLocked()
 	m.mu.Unlock()
+	m.deliverPeerAudio(pcm)
+}
+
+func (m *CallManager) deliverPeerAudio(pcm []float32) {
 	if m.OnPeerAudio != nil && len(pcm) > 0 {
 		m.OnPeerAudio(pcm)
 	}
 }
 
-// PeerLateDrops conta os pacotes de áudio do peer descartados por atraso/duplicata.
-func (m *CallManager) PeerLateDrops() int64 { return m.peerLateDrops.Load() }
+// Tanto o relay quanto o timer usam audioReceiveMu -> mu, inclusive até o callback.
+func (m *CallManager) schedulePeerAudioLocked() {
+	if m.audioReorderTimer != nil {
+		m.audioReorderTimer.Stop()
+		m.audioReorderTimer = nil
+	}
+	m.audioReceiveEpoch++
+	if len(m.audioReorder.pending) == 0 {
+		return
+	}
+	epoch := m.audioReceiveEpoch
+	m.audioReorderTimer = time.AfterFunc(time.Until(m.audioReorder.deadline()), func() {
+		m.audioReceiveMu.Lock()
+		defer m.audioReceiveMu.Unlock()
+		m.mu.Lock()
+		if epoch != m.audioReceiveEpoch || m.codec == nil || m.srtpSession == nil {
+			m.mu.Unlock()
+			return
+		}
+		pcm := m.drainPeerAudioLocked(time.Now())
+		m.schedulePeerAudioLocked()
+		m.mu.Unlock()
+		m.deliverPeerAudio(pcm)
+	})
+}
+
+func (m *CallManager) drainPeerAudioLocked(now time.Time) []float32 {
+	var out []float32
+	for {
+		p, ok := m.audioReorder.pop(now)
+		if !ok {
+			break
+		}
+		if p.reordered {
+			m.peerReordered.Add(1)
+		}
+		if len(p.payload) == 0 {
+			continue
+		}
+		ts := p.header.Timestamp
+		if m.peerAudioLateLocked(ts) {
+			continue
+		}
+		// PLC ANTES do frame seguinte: no máximo 3 frames, nunca zeros de padding.
+		var plc []float32
+		gap, frameSize := m.peerAudioGapLocked(ts), m.codec.FrameSize()
+		if p.missing > 0 && frameSize > 0 && gap > 0 && gap <= int64(maxPeerPLCFrames*frameSize) && gap%int64(frameSize) == 0 {
+			for n := int64(0); n < gap/int64(frameSize); n++ {
+				pcm, err := m.codec.Decode(nil)
+				if err != nil {
+					break
+				}
+				plc = append(plc, pcm...)
+			}
+		}
+		pcm, err := m.codec.Decode(p.payload)
+		if err != nil || len(pcm) == 0 {
+			m.audioTimelineSet = false
+			continue
+		}
+		pcm = m.alignPeerAudioLocked(ts, pcm)
+		// Em hold o decoder/timeline avançam, sem entregar áudio ao navegador.
+		if !m.held {
+			out = append(out, plc...)
+			out = append(out, pcm...)
+		}
+	}
+	return out
+}
+
+func (m *CallManager) resetPeerAudioLocked(cleanup bool) {
+	m.audioReceiveEpoch++
+	if m.audioReorderTimer != nil {
+		m.audioReorderTimer.Stop()
+		m.audioReorderTimer = nil
+	}
+	if cleanup {
+		m.audioReorder = peerAudioReorder{}
+	} else {
+		m.audioReorder.discardPending()
+	}
+	m.audioTimelineSet = false
+	m.audioPlayedSamples = 0
+}
+
+// Contadores cumulativos lidos sem mu pelo log de playout.
+func (m *CallManager) PeerLateDrops() int64  { return m.peerLateDrops.Load() }
+func (m *CallManager) PeerReordered() int64  { return m.peerReordered.Load() }
+func (m *CallManager) PeerDuplicates() int64 { return m.peerDuplicates.Load() }
 
 func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
 	m.mu.Lock()
@@ -216,15 +317,21 @@ func (m *CallManager) alignPeerAudio(ts uint32, pcm []float32) []float32 {
 	return m.alignPeerAudioLocked(ts, pcm)
 }
 
-const maxPeerGapSamples = 8000
+const (
+	maxPeerGapSamples = 8000
+	maxPeerPLCFrames  = 3
+)
 
-// peerAudioLateLocked roda ANTES de Decode: descartar depois já teria alterado
-// o estado do decoder. Mantém a janela frota6c e permite reinícios grandes.
-func (m *CallManager) peerAudioLateLocked(ts uint32) bool {
+func (m *CallManager) peerAudioGapLocked(ts uint32) int64 {
 	if !m.audioTimelineSet {
-		return false
+		return 0
 	}
-	gap := int64(uint64(ts-m.audioBaseTs)) - int64(m.audioPlayedSamples)
+	return int64(int32(ts - (m.audioBaseTs + uint32(m.audioPlayedSamples))))
+}
+
+// Segunda barreira antes de Decode para timestamps atrasados, mesmo com seq nova.
+func (m *CallManager) peerAudioLateLocked(ts uint32) bool {
+	gap := m.peerAudioGapLocked(ts)
 	if gap < 0 && -gap <= maxPeerGapSamples {
 		m.peerLateDrops.Add(1)
 		return true
@@ -232,29 +339,18 @@ func (m *CallManager) peerAudioLateLocked(ts uint32) bool {
 	return false
 }
 
+// Alinha apenas a referência temporal. Lacunas nunca acrescentam silêncio ao PCM.
 func (m *CallManager) alignPeerAudioLocked(ts uint32, pcm []float32) []float32 {
 	if m.peerAudioLateLocked(ts) {
 		return nil
 	}
-	origLen := uint64(len(pcm))
-	if !m.audioTimelineSet {
+	gap := m.peerAudioGapLocked(ts)
+	if !m.audioTimelineSet || gap < 0 || gap > maxPeerGapSamples {
 		m.audioTimelineSet = true
 		m.audioBaseTs = ts
-		m.audioPlayedSamples = origLen
-		return pcm
+		m.audioPlayedSamples = uint64(len(pcm))
+	} else {
+		m.audioPlayedSamples = uint64(ts-m.audioBaseTs) + uint64(len(pcm))
 	}
-	target := uint64(ts - m.audioBaseTs)
-	gap := int64(target) - int64(m.audioPlayedSamples)
-	if gap < 0 || gap > maxPeerGapSamples {
-		m.audioBaseTs = ts
-		m.audioPlayedSamples = origLen
-		return pcm
-	}
-	if gap > 0 {
-		padded := make([]float32, int(gap)+int(origLen))
-		copy(padded[int(gap):], pcm)
-		pcm = padded
-	}
-	m.audioPlayedSamples = target + origLen
 	return pcm
 }

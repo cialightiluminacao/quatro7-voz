@@ -93,8 +93,7 @@ func (m *CallManager) cleanupMedia() {
 	m.outgoingPreacceptSent = false
 	m.actualPeerSet = false
 	m.captureBuf = nil
-	m.audioTimelineSet = false
-	m.audioPlayedSamples = 0
+	m.resetPeerAudioLocked(true)
 	m.lastSend = time.Time{}
 	// Espera qualquer Decode/Encode em andamento sob mu antes de destruir.
 	// Não segura mu durante relay.Cleanup(), que pode esperar callbacks.

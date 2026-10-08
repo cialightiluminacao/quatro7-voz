@@ -37,7 +37,9 @@ type CallManager struct {
 	peerSsrcs     []uint32
 	actualPeerSet bool
 
-	video *callvideo.Pipeline
+	video       *callvideo.Pipeline
+	videoEpoch  uint64     // invalida respostas/envios em voo de uma negociação anterior
+	videoSendMu sync.Mutex // videoSendMu -> mu; preserva a ordem dos sinais enviados
 
 	firstPacketSent       bool
 	initialTransportSent  bool
@@ -64,13 +66,19 @@ type CallManager struct {
 	audioPlayedSamples uint64
 	// [frota6c] pacotes de áudio do peer descartados por chegarem atrasados/duplicados
 	// (ver alignPeerAudio). Atômico: o loop de playout lê para o log [voz-drift].
-	peerLateDrops atomic.Int64
+	peerLateDrops     atomic.Int64
+	peerReordered     atomic.Int64
+	peerDuplicates    atomic.Int64
+	audioReorder      peerAudioReorder
+	audioReorderTimer *time.Timer
+	audioReceiveEpoch uint64
 
-	OnStateChange func(*CallInfo)
-	OnIncoming    func(*CallInfo)
-	OnEnded       func(*CallInfo)
-	OnPeerAudio   func([]float32)
-	OnPeerVideo   func([]byte)
+	OnStateChange    func(*CallInfo)
+	OnIncoming       func(*CallInfo)
+	OnEnded          func(*CallInfo)
+	OnPeerAudio      func([]float32)
+	OnPeerAudioReset func() // retomada: descarta PCM antigo no playout
+	OnPeerVideo      func([]byte)
 
 	OnVideoUpgradeRequest func(*CallInfo) // o peer pediu um upgrade p/ vídeo
 	OnVideoStateChanged   func(*CallInfo) // qualquer mudança no estado de vídeo
@@ -110,6 +118,8 @@ func (m *CallManager) CurrentCall() *CallInfo {
 // encaminhar o áudio do peer ao navegador. Não sinaliza mute ao WhatsApp de propósito,
 // para o interlocutor continuar recebendo mídia (a música).
 func (m *CallManager) Hold(moh bool) error {
+	m.audioReceiveMu.Lock()
+	defer m.audioReceiveMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.currentCall == nil {
@@ -127,6 +137,8 @@ func (m *CallManager) Hold(moh bool) error {
 
 // Resume tira a chamada da espera e volta a enviar/receber o áudio normalmente.
 func (m *CallManager) Resume() error {
+	m.audioReceiveMu.Lock()
+	defer m.audioReceiveMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.currentCall == nil {
@@ -137,6 +149,11 @@ func (m *CallManager) Resume() error {
 	}
 	m.held = false
 	m.mohEnabled = false
+	m.captureBuf = nil
+	m.resetPeerAudioLocked(false)
+	if m.OnPeerAudioReset != nil {
+		m.OnPeerAudioReset()
+	}
 	m.emitState()
 	return nil
 }

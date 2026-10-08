@@ -15,7 +15,7 @@ func TestAcceptVideoUpgradeSemCamera(t *testing.T) {
 	m, call := activeManager(sock)
 	call.StateData.VideoUpgradeIncoming = true
 
-	if err := m.AcceptVideoUpgradeWith(context.Background(), false); err != nil {
+	if _, err := m.AcceptVideoUpgradeWith(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	if got := sock.videoStateSent(); !reflect.DeepEqual(got, []string{"4"}) {
@@ -50,7 +50,7 @@ func TestRequestVideoUpgradeReligaComState1(t *testing.T) {
 	m, call := activeManager(sock)
 	call.MediaType = core.CallMediaTypeVideo
 	call.StateData.VideoOff = true
-	if err := m.RequestVideoUpgrade(context.Background()); err != nil {
+	if _, err := m.RequestVideoUpgrade(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := sock.videoStateSent(); !reflect.DeepEqual(got, []string{"1"}) {

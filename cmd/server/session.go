@@ -261,7 +261,7 @@ func (s *Session) createCall(callID string, record bool) *call.CallManager {
 // [pacing BR 12/08] Playout paceado (leg WhatsApp->navegador): frames de 20ms (o que o
 // WebRTC/NetEQ espera). [frota6c 06/10] O cushion fixo de 40ms + teto fixo de 200ms deu
 // lugar ao buffer ADAPTATIVO de playout_buffer.go (alvo 60-400ms, descarte suave, teto
-// duro 1000ms) — parâmetros e porquês lá.
+// duro 2000ms) — parâmetros e porquês lá.
 
 // startBrowserPlayout dispara o loop que drena ac.playout a 20ms REGULARES e escreve Opus
 // 20ms no navegador. É a correção do delay: absorve no MOTOR o jitter que a Meta entrega,
@@ -282,7 +282,7 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 		// o ticker/relogio do motor corre rápido. Um só ciclo de ligação já decide.
 		var outFrames int64
 		logStart := time.Now()
-		var lastIn, lastDrop, lastUnder, lastTrim, lastHard, lastLate int64
+		var lastIn, lastDrop, lastUnder, lastTrim, lastHard, lastLate, lastReordered, lastDup int64
 		for {
 			select {
 			case <-stop:
@@ -299,6 +299,7 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 				under, trim, hard := pb.underruns, pb.trimmed, pb.hardDropped
 				ac.playoutMu.Unlock()
 				late := ac.cm.PeerLateDrops() // atômico; cm é fixo desde o createCall
+				reordered, dup := ac.cm.PeerReordered(), ac.cm.PeerDuplicates()
 				send := ac.cm.DrainSendStats()
 				var jitterAvgMs float64
 				if send.JitterIntervals > 0 {
@@ -316,6 +317,9 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 						"target_ms", tgt, "underruns_delta", under-lastUnder,
 						"trimmed_delta", trim-lastTrim, "hard_drop_delta", hard-lastHard,
 						"late_pkts_delta", late-lastLate, "call_id", callID,
+						"padding_ms_delta", 0, // lacunas usam PLC; nenhum padding de zeros
+						"drain_frames_delta", (trim-lastTrim)/playoutFrame48, "cap_drop_ms_delta", (hard-lastHard)/48,
+						"reordered_delta", reordered-lastReordered, "dup_delta", dup-lastDup,
 						"capture_frames_delta", send.CaptureFrames, "capture_underruns_delta", send.CaptureUnderruns,
 						"capture_drop_smp_delta", send.CaptureDroppedSamples, "send_frames_delta", send.SentFrames,
 						"send_jitter_max_ms", float64(send.JitterMax)/float64(time.Millisecond), "send_jitter_avg_ms", jitterAvgMs,
@@ -323,6 +327,7 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 				}
 				logStart, lastIn, lastDrop = now, in, dr
 				lastUnder, lastTrim, lastHard, lastLate = under, trim, hard, late
+				lastReordered, lastDup = reordered, dup
 			}
 			// (1) DECIDE o frame de 20ms só com o buffer (playoutMu). O codec NÃO entra aqui.
 			// emit=false só antes do 1º prime (acumulando o alvo inicial de 60ms).
@@ -435,11 +440,18 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		// inflava o jitter buffer p/ ~1s. Agora empilha o PCM 48k; o loop startBrowserPlayout
 		// drena a 20ms REGULARES, absorvendo o jitter no motor. [frota6c] O buffer é
 		// adaptativo (playout_buffer.go): a chegada só enfileira; descarte (suave ou acima
-		// do teto duro de 1000ms) é decidido no tick.
+		// do teto duro de 2000ms) é decidido no tick.
 		pcm48 := media.Upsample16to48(pcm16)
 		ac.playoutMu.Lock()
 		ac.playout.push(pcm48)
 		ac.playoutMu.Unlock()
+	}
+	cm.OnPeerAudioReset = func() {
+		if ac, ok := s.reg.get(callID); ok {
+			ac.playoutMu.Lock()
+			ac.playout.flush()
+			ac.playoutMu.Unlock()
+		}
 	}
 	cm.OnPeerVideo = func(au []byte) {
 		ac, ok := s.reg.get(callID)
@@ -449,12 +461,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		_ = ac.bridge.WriteVideo(au)
 	}
 	cm.OnVideoUpgradeRequest = func(c *call.CallInfo) {
-		s.mgr.broker.emitVideoState(s.id, c.CallID, "upgrade-request", c.StateData.PeerVideoOn,
-			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing)
+		s.mgr.broker.emitVideoState(s.id, c.CallID, "upgrade-request", c.StateData)
 	}
 	cm.OnVideoStateChanged = func(c *call.CallInfo) {
-		s.mgr.broker.emitVideoState(s.id, c.CallID, "state", c.StateData.PeerVideoOn,
-			!c.StateData.VideoOff, c.StateData.VideoUpgradeIncoming, c.StateData.VideoUpgradeOutgoing)
+		s.mgr.broker.emitVideoState(s.id, c.CallID, "state", c.StateData)
 	}
 }
 

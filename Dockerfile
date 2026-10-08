@@ -33,8 +33,11 @@ RUN if [ "$TARGETARCH" = "arm64" ] || [ "$(uname -m)" = "aarch64" ]; then \
     fi
 # As opções OPUS_X86_PRESUME_* só existem no ramo x86 do cmake do opus; em arm64
 # são inofensivas (variáveis não usadas), então mantê-las não quebra o build.
+# Hardening/assertions chamam abort() com pacotes malformados da rede,
+# derrubando o processo inteiro e todas as chamadas.
 RUN cmake -B build -G Ninja -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
         -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF \
+        -DOPUS_HARDENING=OFF -DOPUS_ASSERTIONS=OFF \
         -DOPUS_X86_PRESUME_AVX=OFF -DOPUS_X86_PRESUME_AVX2=OFF \
     && cmake --build build \
     && cp "$(readlink -f build/libopus.so)" /opt/libopus_mlow.so \

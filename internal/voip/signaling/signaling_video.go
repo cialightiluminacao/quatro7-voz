@@ -16,7 +16,7 @@ const (
 	VideoStateDisabled         = 0  // vídeo desligado
 	VideoStateEnabled          = 1  // câmera ligada (sem dec)
 	VideoStateUpgradeRequest   = 3  // pedido de upgrade (legado)
-	VideoStateUpgradeAccept    = 4  // aceita o upgrade (dec = H264,AV1)
+	VideoStateUpgradeAccept    = 4  // aceita o upgrade (dec = H264)
 	VideoStateUpgradeReject    = 5  // recusa o upgrade
 	VideoStateStopped          = 6  // parou/desligou o vídeo (downgrade)
 	VideoStateUpgradeCancel    = 8  // cancela o próprio pedido
@@ -26,7 +26,7 @@ const (
 // Listas de decoder anunciadas na negociação de vídeo.
 const (
 	VideoDecRequest = "H264"
-	VideoDecAccept  = "H264,AV1"
+	VideoDecAccept  = "H264"
 )
 
 // VideoStateParams descreve uma stanza <video state=N> de saída.

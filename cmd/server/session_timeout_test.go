@@ -36,9 +36,13 @@ func (sock *timeoutTestSocket) Query(ctx context.Context, n waBinary.Node) (*waB
 }
 
 func ringingTimeoutSession() (*Session, *activeCall) {
+	return ringingTimeoutSessionWithSocket(&timeoutTestSocket{})
+}
+
+func ringingTimeoutSessionWithSocket(sock core.VoipSocket) (*Session, *activeCall) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &Session{log: log, reg: newCallRegistry(), mgr: &SessionManager{appCtx: context.Background(), broker: NewBroker()}}
-	cm := call.NewCallManager(&timeoutTestSocket{}, log)
+	cm := call.NewCallManager(sock, log)
 	peer := types.NewJID("123", types.HiddenUserServer)
 	cm.HandleCallOffer(context.Background(), &waBinary.Node{Tag: "call", Content: []waBinary.Node{
 		{Tag: "offer", Attrs: waBinary.Attrs{"call-id": "c1", "call-creator": peer.String()}},

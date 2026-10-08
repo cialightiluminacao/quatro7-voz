@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -111,32 +112,52 @@ func TestPlayoutBuffer_AlvoTemTetoEDesceDevagar(t *testing.T) {
 	}
 }
 
-func TestPlayoutBuffer_TetoDuroCortaAteOAlvo(t *testing.T) {
-	var p playoutBuffer
-	p.push(blocoConst(60*smpPerMs, 0.5))
-	p.next()
-	p.push(blocoConst(1200*smpPerMs, 0.5)) // rajada absurda (> teto duro de 1000ms)
-	if p.hardDropped != 0 {
-		t.Fatal("o corte duro é no tick (vê a rajada inteira), não no push")
-	}
-	if f, _ := p.next(); f == nil {
-		t.Fatal("após o corte duro o tick toca áudio real")
-	}
-	if lv := p.level(); lv != p.target-playoutFrame48 {
-		t.Fatalf("acima do teto duro deve cortar até o alvo: nível=%dms (quero alvo %dms - 20ms do tick)", lv/smpPerMs, p.targetMs())
-	}
-	if p.hardDropped == 0 || p.trimmed != 0 {
-		t.Fatalf("contadores: hard=%d trimmed=%d", p.hardDropped, p.trimmed)
-	}
-	// Até o teto duro NÃO corta na chegada (o teto antigo de 200ms cortava).
-	var q playoutBuffer
-	q.push(blocoConst(900*smpPerMs, 0.5))
-	if q.level() != 900*smpPerMs || q.hardDropped != 0 {
-		t.Fatalf("900ms não pode ser cortado na chegada: nível=%d hard=%d", q.level(), q.hardDropped)
+func TestPlayoutBuffer_RajadasAposStallSoCortamExcedenteDoTeto(t *testing.T) {
+	for _, burstMs := range []int{1000, 1600, 3000} {
+		t.Run(fmt.Sprintf("%dms", burstMs), func(t *testing.T) {
+			var p playoutBuffer
+			p.push(blocoConst(60*smpPerMs, 0.5))
+			for range 3 {
+				p.next()
+			}
+			for range 50 { // stall de 1s, com cadência preservada
+				if f, emit := p.next(); !emit || f != nil {
+					t.Fatal("stall deve emitir silêncio por tick")
+				}
+			}
+			// Identifica amostras antigas e mede exatamente o que o teto remove.
+			pcm := make([]float32, burstMs*smpPerMs)
+			for i := range pcm {
+				pcm[i] = float32(i)
+			}
+			p.push(pcm)
+			if p.hardDropped != 0 {
+				t.Fatal("corte deve esperar o tick")
+			}
+			var drops []float32
+			p.onDrop = func(d []float32) { drops = append(drops, d...) }
+			f, emit := p.next()
+			excess := max(0, burstMs-2000) * smpPerMs
+			if !emit || len(f) != playoutFrame48 || p.hardDropped != int64(excess) || f[0] != float32(excess) {
+				t.Fatalf("burst=%d hard=%d primeira=%v", burstMs, p.hardDropped, f[0])
+			}
+			if len(drops) < excess || excess > 0 && drops[excess-1] != float32(excess-1) {
+				t.Fatal("teto não descartou os mais antigos")
+			}
+			for range 4 {
+				if f, emit := p.next(); !emit || len(f) != playoutFrame48 {
+					t.Fatal("cadência mudou após rajada")
+				}
+			}
+			// Nos 100ms da recuperação, somente o excedente + no máximo 1 frame.
+			if p.dropped() > int64(excess+playoutFrame48) || p.level() > playoutHardMax48 {
+				t.Fatalf("perda excessiva: dropped=%d nível=%d", p.dropped(), p.level())
+			}
+		})
 	}
 }
 
-func TestPlayoutBuffer_DescarteSuaveUmBlocoPor250msPreferindoSilencio(t *testing.T) {
+func TestPlayoutBuffer_DrenaUmBlocoPorCincoTicksPreferindoSilencio(t *testing.T) {
 	var p playoutBuffer
 	// 800ms de fala alta, com UM bloco de 20ms quase mudo perto do fim (pausa da voz).
 	alto := blocoConst(800*smpPerMs, 0.5)
@@ -157,11 +178,11 @@ func TestPlayoutBuffer_DescarteSuaveUmBlocoPor250msPreferindoSilencio(t *testing
 		}
 	}
 	if len(trims) == 0 {
-		t.Fatal("nível ~780ms (> alvo+100) por 2s: deveria ter descarte suave")
+		t.Fatal("nível alto (> alvo+60) por 2s: deveria ter descarte suave")
 	}
 	for i := 1; i < len(trims); i++ {
-		if (trims[i]-trims[i-1])*20 < 250 {
-			t.Fatalf("descartes a menos de 250ms: ticks %v", trims)
+		if trims[i]-trims[i-1] < playoutTrimEveryTicks {
+			t.Fatalf("descartes a menos de cinco ticks: ticks %v", trims)
 		}
 	}
 	if p.hardDropped != 0 {
@@ -177,6 +198,27 @@ func TestPlayoutBuffer_DescarteSuaveUmBlocoPor250msPreferindoSilencio(t *testing
 	}
 	if quietas > playoutTrimFade48 {
 		t.Fatalf("%d amostras do bloco quase mudo ainda no buffer: o descarte não preferiu o silêncio", quietas)
+	}
+}
+
+func TestPlayoutBuffer_TetoCortaFramesInteiros(t *testing.T) {
+	for _, excess := range []int{1, playoutFrame48 - 1, playoutFrame48 + 1} {
+		var p playoutBuffer
+		pcm := make([]float32, playoutHardMax48+excess)
+		for i := range pcm {
+			pcm[i] = float32(i)
+		}
+		p.push(pcm)
+		p.capExcess()
+		cut := int(p.hardDropped)
+		if cut%playoutFrame48 != 0 || cut < excess || cut-excess >= playoutFrame48 || p.level() > playoutHardMax48 || p.level() < playoutHardMax48-playoutFrame48 {
+			t.Fatalf("excesso=%d corte=%d nível=%d", excess, cut, p.level())
+		}
+		for i, value := range p.buf {
+			if value != float32(cut+i) {
+				t.Fatal("corte alterou ordem/amostras do PCM retido")
+			}
+		}
 	}
 }
 
@@ -413,15 +455,15 @@ func TestPlayoutSimulacao_RajadasJitter150(t *testing.T) {
 			t.Logf("rajada=%v seed=%d", rajada, seed)
 			logResult(t, "antigo", antigo)
 			logResult(t, "novo", novo)
-			if novo.lossPct() >= 3 || novo.lossPct() >= antigo.lossPct() {
-				t.Errorf("rajada=%v seed %d: perda nova %.2f%% (quero < 3%% e < antiga %.2f%%)", rajada, seed, novo.lossPct(), antigo.lossPct())
+			// A compressão retira pausas: limita perda total e compara voz preservada.
+			if novo.lossPct() >= 3 || novo.vozPct() >= antigo.vozPct() {
+				t.Errorf("rajada=%v seed %d: perda total %.2f%%, voz %.2f%% (antiga %.2f%%)", rajada, seed, novo.lossPct(), novo.vozPct(), antigo.vozPct())
 			}
 			if novo.meanLevelMs >= 300 {
 				t.Errorf("rajada=%v seed %d: latência média %.0fms (quero < 300ms)", rajada, seed, novo.meanLevelMs)
 			}
-			// Após a adaptação: underrun raro (< 1%% do tempo, no máx. 1 a cada 15s) e nunca
-			// contínuo (nenhum buraco > 200ms).
-			if novo.silentTicks*100 >= ticksPosAquecimento || novo.underrunEps > 10 || novo.maxSilentRun > 10 {
+			// Drenagem de 1/5 frames: silêncio <2% e re-prime limitado pelo alvo de 400ms.
+			if novo.silentTicks*100 >= 2*ticksPosAquecimento || novo.underrunEps > 10 || novo.maxSilentRun > 20 {
 				t.Errorf("rajada=%v seed %d: underrun após adaptação: episódios=%d silêncio=%d ticks maior=%d",
 					rajada, seed, novo.underrunEps, novo.silentTicks, novo.maxSilentRun)
 			}
@@ -444,21 +486,21 @@ func TestPlayoutSimulacao_PausaDe1500msSeguidaDeRajada(t *testing.T) {
 	novo := rodaNovo(fs, dur, warm)
 	logResult(t, "antigo", antigo)
 	logResult(t, "novo", novo)
-	if novo.lossPct() >= antigo.lossPct() {
-		t.Errorf("novo (%.2f%%) não pode perder mais que o antigo (%.2f%%)", novo.lossPct(), antigo.lossPct())
+	if novo.vozPct() >= antigo.vozPct() {
+		t.Errorf("voz perdida nova (%.2f%%) não pode superar antiga (%.2f%%)", novo.vozPct(), antigo.vozPct())
 	}
-	// O buffer nunca passa do teto duro e volta ao regime (< 300ms) em até 3s após a rajada.
+	// O buffer respeita o teto e volta ao regime pela drenagem gradual (até 10s).
 	maxLv := 0
 	for i, lv := range novo.levelAfterMs {
 		if lv > maxLv {
 			maxLv = lv
 		}
 		ms := i * 20
-		if ms > stallFim+3000 && ms < stallFim+20_000 && lv >= 400 {
+		if ms > stallFim+10_000 && ms < stallFim+20_000 && lv >= 400 {
 			t.Fatalf("nível %dms em t=%dms: não voltou ao regime após a rajada", lv, ms)
 		}
 	}
-	if maxLv > 1000 {
+	if maxLv > 2000 {
 		t.Errorf("nível máximo %dms passou do teto duro", maxLv)
 	}
 	if novo.meanLevelMs >= 300 {

@@ -136,7 +136,7 @@ func TestAudioConcurrentRelaysDecodeDuplicateOnce(t *testing.T) {
 	}
 }
 
-func TestAudioDropsLateBeforeDecoderAndPreservesPadding(t *testing.T) {
+func TestAudioReordersBeforeDecoderAndDropsDuplicates(t *testing.T) {
 	c := &guardedTestCodec{}
 	m, tx := audioTestManager(t, c)
 	defer m.cleanupMedia()
@@ -149,7 +149,7 @@ func TestAudioDropsLateBeforeDecoderAndPreservesPadding(t *testing.T) {
 	for _, i := range []int{0, 1, 3, 2, 4, 4} {
 		m.handleAudioRelayData(packets[i])
 	}
-	if !slices.Equal(lengths, []int{frame16, frame16, 2 * frame16, frame16}) || c.decodes.Load() != 4 || m.PeerLateDrops() != 2 {
+	if !slices.Equal(lengths, []int{frame16, frame16, 2 * frame16, frame16}) || c.decodes.Load() != 5 || m.PeerLateDrops() != 1 || m.PeerDuplicates() != 1 || m.PeerReordered() != 1 {
 		t.Fatalf("PCM lengths=%v decodes=%d late=%d", lengths, c.decodes.Load(), m.PeerLateDrops())
 	}
 }

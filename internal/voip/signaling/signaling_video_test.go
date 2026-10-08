@@ -51,14 +51,14 @@ func TestUpgradeRequestV2Shape(t *testing.T) {
 	}
 }
 
-// O accept do upgrade leva dec=H264,AV1; o enabled (câmera on) NÃO leva dec.
+// O accept do upgrade leva dec=H264; o enabled (câmera on) NÃO leva dec.
 func TestUpgradeAcceptAndEnabledShapes(t *testing.T) {
 	accept := BuildVideoStateStanza(VideoStateParams{
 		CallID: "CID", To: testPeer(), CallCreator: testCreator(),
 		State: VideoStateUpgradeAccept, Dec: VideoDecAccept,
 	})
-	if got := attr(videoChild(t, accept), "dec"); got != "H264,AV1" {
-		t.Errorf("accept dec = %q, quer H264,AV1", got)
+	if got := attr(videoChild(t, accept), "dec"); got != "H264" {
+		t.Errorf("accept dec = %q, quer H264", got)
 	}
 	if got := attr(videoChild(t, accept), "voip_settings"); got != "" {
 		t.Errorf("accept não deve levar voip_settings, veio %q", got)

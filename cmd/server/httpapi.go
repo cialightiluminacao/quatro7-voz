@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"wacalls/internal/voip/call"
 	"wacalls/internal/voip/core"
 	"wacalls/internal/voip/media"
 
@@ -406,15 +407,16 @@ func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var err error
+	var videoState call.CallStateData
 	switch action := r.PathValue("action"); action {
 	case "request":
-		err = ac.cm.RequestVideoUpgrade(r.Context())
+		videoState, err = ac.cm.RequestVideoUpgrade(r.Context())
 	case "accept":
-		err = ac.cm.AcceptVideoUpgradeWith(r.Context(), videoAcceptComCamera(r))
+		videoState, err = ac.cm.AcceptVideoUpgradeWith(r.Context(), videoAcceptComCamera(r))
 	case "reject":
-		err = ac.cm.RejectVideoUpgrade(r.Context())
+		videoState, err = ac.cm.RejectVideoUpgrade(r.Context())
 	case "stop":
-		err = ac.cm.StopVideo(r.Context())
+		videoState, err = ac.cm.StopVideo(r.Context())
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown video action"})
 		return
@@ -423,7 +425,9 @@ func (s *server) handleCallVideo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "videoState": videoStatePayload(sess.id, id, "state", videoState),
+	})
 }
 
 // videoAcceptComCamera lê o corpo opcional {"withCamera": false} de video/accept.

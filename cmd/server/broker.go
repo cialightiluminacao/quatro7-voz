@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"wacalls/internal/voip/call"
 )
 
 type CallStatus string
@@ -327,12 +329,21 @@ func (b *Broker) emitIncoming(sessionID, id, peer, phone, name string, video boo
 
 // emitVideoState avisa a UI sobre negociação de vídeo mid-call (pedido de upgrade,
 // câmera do peer ligada/desligada, etc.). Escopado por conta como as chamadas.
-func (b *Broker) emitVideoState(sessionID, id, kind string, peerVideo, localVideo, upgradeIncoming, upgradeOutgoing bool) {
-	b.broadcastForSession(sessionID, map[string]any{
+func videoStatePayload(sessionID, id, kind string, sd call.CallStateData) map[string]any {
+	orientation := sd.PeerOrientation
+	if orientation < 0 || orientation > 3 {
+		orientation = 0
+	}
+	return map[string]any{
 		"type": "video-state", "sessionId": sessionID, "id": id, "kind": kind,
-		"peerVideo": peerVideo, "localVideo": localVideo,
-		"upgradeIncoming": upgradeIncoming, "upgradeOutgoing": upgradeOutgoing,
-	})
+		"peerVideo": sd.PeerVideoOn, "localVideo": !sd.VideoOff,
+		"upgradeIncoming": sd.VideoUpgradeIncoming, "upgradeOutgoing": sd.VideoUpgradeOutgoing,
+		"motivo": sd.VideoMotivo, "peerOrientation": orientation,
+	}
+}
+
+func (b *Broker) emitVideoState(sessionID, id, kind string, sd call.CallStateData) {
+	b.broadcastForSession(sessionID, videoStatePayload(sessionID, id, kind, sd))
 }
 
 func (b *Broker) emitIncomingClaimed(sessionID, id, owner string) {

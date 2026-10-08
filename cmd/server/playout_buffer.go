@@ -1,38 +1,22 @@
 package main
 
-// [frota6c 06/10] Buffer de playout ADAPTATIVO do leg WhatsApp->navegador.
-//
-// Problema medido (ligação real 06/10 11:36): o áudio da Meta chega em RAJADAS (janelas
-// de 5s com in_x_realtime de 0,61 a 1,37; frames MLow de 60ms). Com o teto FIXO de 200ms
-// o buffer oscilava 0<->200ms: descartava o excedente na chegada e entrava silêncio no
-// underrun — ~20-27% da voz jogada fora ("picotando").
-//
-// Desenho:
-//   - ALVO dinâmico de latência: começa em 60ms; +20ms a cada episódio de underrun (teto
-//     400ms); -10ms a cada 10s sem underrun (piso 60ms). O prime (inicial e após underrun)
-//     espera o buffer chegar ao alvo — emitindo SILÊNCIO depois do 1º prime, para a
-//     cadência de 20ms nunca parar ([P2]: buraco de RTP faz o NetEQ do Chrome re-inflar).
-//   - Excesso SUSTENTADO (nível > alvo+100ms por 1s seguido): descarta UM bloco de
-//     20ms a cada >=260ms, escolhendo o de MENOR energia entre os já enfileirados (pausa
-//     da voz / padding de silêncio), com crossfade de 2ms para não estalar.
-//   - Teto DURO de 1000ms (memória/latência extrema): acima dele, no tick, corta até o
-//     alvo descartando o mais antigo (como o teto antigo, só que muito mais alto).
-//
-// Tudo é Go puro e o relógio é o próprio tick (cada next() = 20ms), para testar sem cgo e
-// sem tempo real. NÃO é thread-safe: o chamador segura activeCall.playoutMu.
+// Buffer de playout adaptativo WhatsApp->navegador. Cada next() = 20ms.
+// Alvo 60–400ms, silêncio no underrun/re-prime e decaimento após 10s estáveis.
+// Acima de alvo+60ms, comprime o tempo retirando no máximo 1 frame a cada 5 ticks,
+// com crossfade. O teto de 2000ms retira somente o excedente, mais antigo primeiro.
+// Não é thread-safe: o chamador segura activeCall.playoutMu.
 
 const (
-	playoutFrame48         = 960      // 20ms @ 48kHz
-	playoutMinTarget48     = 60 * 48  // alvo inicial e piso
-	playoutMaxTarget48     = 400 * 48 // teto do alvo
-	playoutTargetUp48      = 20 * 48  // por episódio de underrun
-	playoutTargetDown48    = 10 * 48  // por janela estável
-	playoutDecayTicks      = 500      // 10s sem underrun
-	playoutHardMax48       = 1000 * 48
-	playoutTrimMargin48    = 100 * 48 // excesso tolerado acima do alvo
-	playoutTrimSustainTick = 50       // 1s seguido acima de alvo+margem
-	playoutTrimEveryTicks  = 13       // >=260ms entre descartes suaves
-	playoutTrimFade48      = 96       // crossfade de 2ms na emenda do descarte
+	playoutFrame48        = 960      // 20ms @ 48kHz
+	playoutMinTarget48    = 60 * 48  // alvo inicial e piso
+	playoutMaxTarget48    = 400 * 48 // teto do alvo
+	playoutTargetUp48     = 20 * 48  // por episódio de underrun
+	playoutTargetDown48   = 10 * 48  // por janela estável
+	playoutDecayTicks     = 500      // 10s sem underrun
+	playoutHardMax48      = 2000 * 48
+	playoutTrimMargin48   = 60 * 48 // excesso tolerado acima do alvo
+	playoutTrimEveryTicks = 5       // >=100ms entre descartes suaves
+	playoutTrimFade48     = 96      // crossfade de 2ms na emenda do descarte
 )
 
 type playoutBuffer struct {
@@ -43,7 +27,6 @@ type playoutBuffer struct {
 	// alvo (emitindo silêncio) e conta o episódio uma vez só.
 	rePriming      bool
 	ticksStable    int // ticks com áudio real desde o último underrun/decaimento
-	ticksAbove     int // ticks seguidos com nível > alvo+margem
 	ticksSinceTrim int
 
 	// Métricas acumuladas (o loop loga os deltas no [voz-drift]).
@@ -58,7 +41,6 @@ type playoutBuffer struct {
 func (p *playoutBuffer) init() {
 	if p.target == 0 {
 		p.target = playoutMinTarget48
-		p.ticksSinceTrim = playoutTrimEveryTicks
 	}
 }
 
@@ -74,22 +56,27 @@ func (p *playoutBuffer) push(pcm []float32) {
 	p.buf = append(p.buf, pcm...)
 }
 
-// hardCut: acima do teto duro, corta (o mais antigo) até o alvo. Roda no tick e não no
-// push: uma rajada chega em vários push seguidos (um por pacote de 60ms) e, cortando a
-// cada push, o corte acontecia no MEIO dela e o resto ainda inflava o buffer. No tick o
-// corte vê a rajada inteira — um só buraco, e o nível volta direto ao alvo. A memória
-// fica limitada ao teto + o que chega em 20ms.
-func (p *playoutBuffer) hardCut() {
+// capExcess roda no tick, quando a rajada inteira já chegou.
+func (p *playoutBuffer) capExcess() {
 	if len(p.buf) <= playoutHardMax48 {
 		return
 	}
-	cut := len(p.buf) - p.target
+	// Arredonda para frames de 20ms, preservando o alinhamento do PCM restante.
+	excess := len(p.buf) - playoutHardMax48
+	cut := (excess + playoutFrame48 - 1) / playoutFrame48 * playoutFrame48
 	if p.onDrop != nil {
 		p.onDrop(p.buf[:cut])
 	}
 	p.hardDropped += int64(cut)
 	p.buf = append(p.buf[:0], p.buf[cut:]...)
-	p.ticksAbove = 0
+}
+
+// flush descarta áudio velho na retomada, mantendo alvo e métricas cumulativas.
+// Se já houve prime, o próximo tick segue emitindo silêncio até re-prime.
+func (p *playoutBuffer) flush() {
+	p.buf = nil
+	p.rePriming = p.primed
+	p.ticksStable, p.ticksSinceTrim = 0, 0
 }
 
 // next devolve o frame de 20ms deste tick. emit=false só antes do 1º prime (nada a
@@ -104,7 +91,7 @@ func (p *playoutBuffer) next() (frame []float32, emit bool) {
 		p.primed = true
 	}
 	p.ticksSinceTrim++
-	p.hardCut()
+	p.capExcess()
 	if p.rePriming && len(p.buf) >= p.target {
 		p.rePriming = false
 	}
@@ -115,7 +102,6 @@ func (p *playoutBuffer) next() (frame []float32, emit bool) {
 			p.target = min(p.target+playoutTargetUp48, playoutMaxTarget48)
 		}
 		p.ticksStable = 0
-		p.ticksAbove = 0
 		return nil, true
 	}
 	frame = make([]float32, playoutFrame48)
@@ -127,12 +113,7 @@ func (p *playoutBuffer) next() (frame []float32, emit bool) {
 		p.ticksStable = 0
 		p.target = max(p.target-playoutTargetDown48, playoutMinTarget48)
 	}
-	if len(p.buf) > p.target+playoutTrimMargin48 {
-		p.ticksAbove++
-	} else {
-		p.ticksAbove = 0
-	}
-	if p.ticksAbove >= playoutTrimSustainTick && p.ticksSinceTrim >= playoutTrimEveryTicks {
+	if len(p.buf) > p.target+playoutTrimMargin48 && p.ticksSinceTrim >= playoutTrimEveryTicks {
 		p.trimQuietest()
 		p.ticksSinceTrim = 0
 	}

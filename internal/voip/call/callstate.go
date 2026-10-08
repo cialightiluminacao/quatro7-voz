@@ -21,6 +21,8 @@ type CallStateData struct {
 	PeerVideoOn          bool // câmera do peer está ligada
 	VideoUpgradeIncoming bool // o peer pediu upgrade e aguarda nossa decisão
 	VideoUpgradeOutgoing bool // nós pedimos upgrade e aguardamos o peer
+	VideoMotivo          string
+	PeerOrientation      int // quartos de volta (0..3); desconhecido = 0
 }
 
 type CallInfo struct {

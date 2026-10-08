@@ -28,11 +28,11 @@ func TestAlignPeerAudio_AtrasadoOuDuplicadoNaoInflaATimeline(t *testing.T) {
 	}
 	feed(0)
 	feed(1 * frame16)
-	// pacote 2 perdido por ora: o 3 chega e a lacuna vira silêncio (como antes)
-	if n := feed(3 * frame16); n != 2*frame16 {
-		t.Fatalf("lacuna de 1 pacote: quero padding de 60ms + 60ms, veio %d", n)
+	// Sem decoder neste teste, a lacuna não acrescenta nada ao PCM.
+	if n := feed(3 * frame16); n != frame16 {
+		t.Fatalf("lacuna de 1 pacote: quero somente os 60ms recebidos, veio %d", n)
 	}
-	// o 2 chega ATRASADO (retransmissão): o slot já foi tocado como silêncio → descarta
+	// o 2 chega ATRASADO (retransmissão): o slot já foi ultrapassado → descarta
 	if n := feed(2 * frame16); n != 0 {
 		t.Fatalf("pacote atrasado deve ser descartado, veio %d amostras", n)
 	}
@@ -43,8 +43,8 @@ func TestAlignPeerAudio_AtrasadoOuDuplicadoNaoInflaATimeline(t *testing.T) {
 	if n := feed(4 * frame16); n != 0 {
 		t.Fatalf("duplicata deve ser descartada, veio %d amostras", n)
 	}
-	if total != 5*frame16 {
-		t.Fatalf("timeline: %d amostras para 5 slots de 60ms (quero %d)", total, 5*frame16)
+	if total != 4*frame16 {
+		t.Fatalf("timeline: %d amostras sem padding para os 5 slots (quero %d)", total, 4*frame16)
 	}
 	if got := m.PeerLateDrops(); got != 2 {
 		t.Fatalf("PeerLateDrops = %d, quero 2", got)

@@ -32,6 +32,7 @@ type SrtpContext struct {
 	authKey     []byte
 	roc         uint32
 	lastSeq     uint16
+	ssrc        uint32
 	initialized bool
 	authTagLen  int
 }
@@ -109,13 +110,39 @@ func (c *SrtpContext) Unprotect(data []byte) (*RtpPacket, error) {
 		return nil, &SrtpError{SrtpErrPacketTooShort, fmt.Sprintf("no payload: %dB total, %dB header, auth=%d", len(data), headerSize, c.authTagLen)}
 	}
 
-	c.updateRoc(header.SequenceNumber)
-	index := c.packetIndex(header.SequenceNumber)
+	// Estima o ROC sem avançar o receptor: pacotes fora de ordem podem pertencer
+	// ao ciclo anterior, e falhas de autenticação não alteram estado algum.
+	roc := c.roc
+	if !c.initialized || header.Ssrc != c.ssrc {
+		roc = 0
+	} else {
+		diff := int32(header.SequenceNumber) - int32(c.lastSeq)
+		if diff < -32768 {
+			roc++
+		} else if diff > 32768 && roc > 0 {
+			roc--
+		}
+	}
+	authData, authTag := data[:headerSize+payloadLen], data[headerSize+payloadLen:]
+	if !hmac.Equal(authTag, c.computeAuthTag(authData, roc, c.authTagLen)) {
+		// Um reinício pode baixar a sequência sem rollover, ou voltar ao ROC zero.
+		if hmac.Equal(authTag, c.computeAuthTag(authData, c.roc, c.authTagLen)) {
+			roc = c.roc
+		} else if hmac.Equal(authTag, c.computeAuthTag(authData, 0, c.authTagLen)) {
+			roc = 0
+		} else {
+			return nil, &SrtpError{SrtpErrAuthFailed, "authentication failed"}
+		}
+	}
+	index := uint64(roc)<<16 | uint64(header.SequenceNumber)
 
 	iv := c.generateIV(header.Ssrc, index)
 	decrypted := make([]byte, payloadLen)
 	if err := aesCtrXor(c.sessionKey, iv, data[headerSize:headerSize+payloadLen], decrypted); err != nil {
 		return nil, &SrtpError{SrtpErrDecryption, err.Error()}
+	}
+	if !c.initialized || header.Ssrc != c.ssrc || index > c.packetIndex(c.lastSeq) {
+		c.roc, c.lastSeq, c.ssrc, c.initialized = roc, header.SequenceNumber, header.Ssrc, true
 	}
 
 	return &RtpPacket{Header: header, Payload: decrypted}, nil
