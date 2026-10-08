@@ -33,7 +33,10 @@ type activeCall struct {
 	// (opus_encoder_destroy) podia rodar durante o oc.Encode do loop → use-after-free no cgo
 	// → segfault do motor (derruba TODAS as chamadas da célula). Atingível a cada re-offer do
 	// navegador (reload/ICE-restart/transferência).
-	mediaMu sync.Mutex
+	mediaMu        sync.Mutex
+	bridgeOpMu     sync.Mutex    // serializes attachment/detachment and server playback; never taken by cm callbacks
+	mediaEpoch     atomic.Uint64 // copy of cm browser epoch, published with the registry swap
+	transferTarget string        // bridgeOpMu; empty means the shared queue
 	// Ordem: mediaMu -> reg.mu -> mutex interno do codec. reg.mu é liberado
 	// antes de Decode/Encode/Close. Nunca chamar cm (mu) sob mediaMu: callbacks
 	// OnStateChange rodam com cm.mu e podem esperar o fechamento da mídia.

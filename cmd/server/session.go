@@ -335,6 +335,7 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 			// cadência RTP de 20ms NUNCA para — evita o gap que faria o NetEQ do Chrome
 			// re-inflar o buffer. O re-prime (segurar até o nível voltar ao alvo) é com
 			// silêncio emitido, não com pausa de envio.
+			frameEpoch := ac.mediaEpoch.Load()
 			ac.playoutMu.Lock()
 			frame, emit := ac.playout.next()
 			ac.playoutMu.Unlock()
@@ -350,6 +351,9 @@ func (s *Session) startBrowserPlayout(callID string, ac *activeCall) {
 			// inteiro DEPOIS (mediaOf devolve o novo). [P1] evita opus_encoder_destroy correndo
 			// contra o Encode → segfault. Encode é cgo sub-ms; o Close espera no máx. 1 tick.
 			ac.mediaMu.Lock()
+			if frameEpoch != ac.mediaEpoch.Load() {
+				frame = silence // a frame selected before the swap must not reach the new browser
+			}
 			b, oc, ok := s.reg.mediaOf(callID)
 			if ok && b != nil && oc != nil {
 				if opus, err := oc.Encode(frame); err == nil && len(opus) > 0 {
@@ -431,6 +435,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		// grava o lado do peer (WhatsApp) mesmo se o navegador ainda não estiver pronto
 		ac.recorder.writePeer(pcm16)
+		epoch := ac.mediaEpoch.Load()
 		b, oc, found := s.reg.mediaOf(callID)
 		if !found || b == nil || oc == nil {
 			return
@@ -443,7 +448,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		// do teto duro de 2000ms) é decidido no tick.
 		pcm48 := media.Upsample16to48(pcm16)
 		ac.playoutMu.Lock()
-		ac.playout.push(pcm48)
+		if epoch == ac.mediaEpoch.Load() {
+			ac.playout.push(pcm48)
+		}
 		ac.playoutMu.Unlock()
 	}
 	cm.OnPeerAudioReset = func() {
@@ -962,35 +969,79 @@ func jidOf(c *whatsmeow.Client) string {
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
 	ac, ok := s.reg.get(callID)
 	if !ok {
-		b.Close()
+		if b != nil {
+			b.DisableTerminate()
+			b.Close()
+		}
 		if oc != nil {
 			oc.Close()
 		}
 		return
 	}
-	// [P1 12/08] Segura o mediaMu em volta do swap E do Close de oldB/oldOC: o loop de playout
-	// usa o codec/ponte sob o MESMO mutex, então nunca há Encode/WriteOpus rodando enquanto
-	// opus_encoder_destroy/PeerConnection.Close executam (senão = use-after-free/segfault).
-	// oldB.DisableTerminate() antes do Close impede que fechar a ponte antiga encerre a chamada.
-	ac.mediaMu.Lock()
-	defer ac.mediaMu.Unlock()
+	ac.bridgeOpMu.Lock()
+	defer ac.bridgeOpMu.Unlock()
+	s.swapBrowserMedia(callID, ac, b, nil, oc)
+}
+
+// swapBrowserMedia requires bridgeOpMu, but calls cm only outside mediaMu.
+// Closing either transport happens after the codec swap, outside mediaMu.
+func (s *Session) swapBrowserMedia(callID string, ac *activeCall, b *Bridge, wsb *wsBridge, oc media.Codec) {
+	attached := b != nil || wsb != nil
+	var epoch uint64
 	if ac.cm != nil {
-		ac.cm.ResetVideoEnvelope()
+		epoch = ac.cm.ResetBrowserMedia(attached)
 	}
-	oldB, oldOC, found := s.reg.setBridge(callID, b, oc)
+	ac.mediaMu.Lock()
+	s.reg.mu.Lock()
+	current, found := s.reg.calls[callID]
+	found = found && current == ac
+	var oldB *Bridge
+	var oldWSB *wsBridge
+	var oldOC media.Codec
+	if found {
+		oldB, oldWSB, oldOC = ac.bridge, ac.wsBridge, ac.browserOpus
+		if oldB != nil {
+			oldB.DisableTerminate()
+		}
+		if oldWSB != nil {
+			oldWSB.DisableTerminate()
+		}
+		ac.mediaEpoch.Store(epoch)
+		ac.bridge, ac.wsBridge, ac.browserOpus = b, wsb, oc
+		if b != nil {
+			b.mediaEpoch.Store(epoch)
+		}
+		if wsb != nil {
+			wsb.mediaEpoch.Store(epoch)
+		}
+		ac.playoutMu.Lock()
+		ac.playout.flush()
+		ac.playoutMu.Unlock()
+	}
+	s.reg.mu.Unlock()
+	if found && oldOC != nil {
+		oldOC.Close()
+	}
+	ac.mediaMu.Unlock()
 	if !found {
-		b.Close()
+		if b != nil {
+			b.DisableTerminate()
+			b.Close()
+		}
+		if wsb != nil {
+			wsb.DisableTerminate()
+			wsb.Close()
+		}
 		if oc != nil {
 			oc.Close()
 		}
 		return
 	}
 	if oldB != nil {
-		oldB.DisableTerminate()
 		oldB.Close()
 	}
-	if oldOC != nil {
-		oldOC.Close()
+	if oldWSB != nil {
+		oldWSB.Close()
 	}
 }
 
@@ -1073,36 +1124,9 @@ func (s *Session) setWSBridge(callID string, b *wsBridge, oc media.Codec) {
 		}
 		return
 	}
-	ac.mediaMu.Lock()
-	if ac.cm != nil {
-		ac.cm.ResetVideoEnvelope()
-	}
-	oldWSB, oldB, oldOC, found := s.reg.setWSBridge(callID, b, oc)
-	if !found {
-		ac.mediaMu.Unlock()
-		b.Close()
-		if oc != nil {
-			oc.Close()
-		}
-		return
-	}
-	if oldB != nil {
-		oldB.DisableTerminate()
-	}
-	if oldWSB != nil {
-		oldWSB.DisableTerminate()
-	}
-	if oldOC != nil {
-		oldOC.Close()
-	}
-	// Close do WS pode esperar o handshake; libera mediaMu antes de fechar as pontes.
-	ac.mediaMu.Unlock()
-	if oldB != nil {
-		oldB.Close()
-	}
-	if oldWSB != nil {
-		oldWSB.Close()
-	}
+	ac.bridgeOpMu.Lock()
+	defer ac.bridgeOpMu.Unlock()
+	s.swapBrowserMedia(callID, ac, nil, b, oc)
 }
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {

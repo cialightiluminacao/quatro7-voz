@@ -93,6 +93,9 @@ func (m *CallManager) cleanupMedia() {
 	m.outgoingPreacceptSent = false
 	m.actualPeerSet = false
 	m.captureBuf = nil
+	m.stopPlaybackLocked()
+	m.browserEpoch++
+	m.browserAttached = false
 	m.resetPeerAudioLocked(true)
 	m.lastSend = time.Time{}
 	// Espera qualquer Decode/Encode em andamento sob mu antes de destruir.

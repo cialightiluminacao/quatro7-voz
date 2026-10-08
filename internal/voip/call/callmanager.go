@@ -27,6 +27,10 @@ type CallManager struct {
 	// Decode/Encode/Close usam mu. Callbacks de áudio rodam SEM mu, e nenhum
 	// caminho com mu travado pode adquirir audioReceiveMu (inclusive cleanup).
 	audioReceiveMu sync.Mutex
+	// Browser video sends and peer video callbacks also finish before a bridge reset.
+	// Reset order: browserVideoMu -> audioReceiveMu -> peerVideoReceiveMu -> mu -> sendStatsMu.
+	browserVideoMu     sync.Mutex
+	peerVideoReceiveMu sync.Mutex
 
 	rtpSession  *media.RtpSession
 	srtpSession *media.SrtpSession
@@ -48,11 +52,15 @@ type CallManager struct {
 	calleeDevices         []types.JID
 	debeEnabled           bool
 
-	captureBuf   []float32
-	sendLoopStop chan struct{}
-	sendStatsMu  sync.Mutex // mu -> sendStatsMu; o leitor nunca adquire mu
-	sendStats    SendStats
-	lastSend     time.Time
+	captureBuf      []float32
+	sendLoopStop    chan struct{}
+	sendStatsMu     sync.Mutex // mu -> sendStatsMu; o leitor nunca adquire mu
+	sendStats       SendStats
+	lastSend        time.Time
+	clock           mediaClock // nil uses the real clock; fixed before starting media
+	playback        *serverPlayback
+	browserEpoch    uint64
+	browserAttached bool
 
 	// Estado de espera (hold). Enquanto held, o áudio do atendente não é enviado:
 	// no lugar vai música de espera (mohEnabled) ou silêncio, e o áudio do peer não
@@ -156,6 +164,7 @@ func (m *CallManager) Resume() error {
 	}
 	m.held = false
 	m.mohEnabled = false
+	m.stopPlaybackLocked()
 	m.captureBuf = nil
 	m.resetPeerAudioLocked(false)
 	if m.OnPeerAudioReset != nil {
@@ -302,7 +311,31 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 }
 
 func (m *CallManager) EndCall(ctx context.Context, reason core.EndCallReason) error {
+	return m.endCall(ctx, reason, nil)
+}
+
+func (m *CallManager) endCall(ctx context.Context, reason core.EndCallReason, playback *serverPlayback) error {
+	return m.endCallForMedia(ctx, reason, playback, 0)
+}
+
+// EndBrowserCall ignores a terminal callback queued before the bridge swap.
+func (m *CallManager) EndBrowserCall(ctx context.Context, reason core.EndCallReason, epoch uint64) error {
+	if epoch == 0 {
+		return nil
+	}
+	return m.endCallForMedia(ctx, reason, nil, epoch)
+}
+
+func (m *CallManager) endCallForMedia(ctx context.Context, reason core.EndCallReason, playback *serverPlayback, browserEpoch uint64) error {
 	m.mu.Lock()
+	if browserEpoch != 0 && (browserEpoch != m.browserEpoch || !m.browserAttached) {
+		m.mu.Unlock()
+		return nil
+	}
+	if playback != nil && m.playback != playback {
+		m.mu.Unlock()
+		return nil
+	}
 	call := m.currentCall
 	if call == nil || call.IsEnded() {
 		m.mu.Unlock()

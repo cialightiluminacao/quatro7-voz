@@ -88,6 +88,7 @@ type Bridge struct {
 	videoDC    atomic.Pointer[webrtc.DataChannel]
 	log        *slog.Logger
 	callID     string
+	mediaEpoch atomic.Uint64
 
 	OnBrowserRTP func(payload []byte)
 	// OnBrowserVideo is invoked with H264 access units captured from the browser camera.

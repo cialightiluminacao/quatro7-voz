@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -21,13 +22,15 @@ import (
 // qualquer proxy reverso. O áudio do peer (WhatsApp → browser) vem pelo mesmo
 // caminho na direção inversa.
 type wsBridge struct {
-	conn        *websocket.Conn
-	ctx         context.Context
-	cancel      context.CancelFunc
-	mu          sync.Mutex
-	closed      bool
-	log         *slog.Logger
-	browserOpus media.Codec
+	conn              *websocket.Conn
+	ctx               context.Context
+	cancel            context.CancelFunc
+	mu                sync.Mutex
+	closed            bool
+	log               *slog.Logger
+	browserOpus       media.Codec
+	mediaEpoch        atomic.Uint64
+	terminateDisabled atomic.Bool
 
 	// Callbacks — mesma semântica de Bridge
 	OnBrowserRTP func(payload []byte) // uplink PCM já convertido em Opus
@@ -76,9 +79,7 @@ func (b *wsBridge) WriteVideo(_ []byte) error { return nil }
 // DisableTerminate evita que o fechamento dispare OnTerminalWS (usado em
 // renegociação/transferência, igual ao comportamento de Bridge.DisableTerminate).
 func (b *wsBridge) DisableTerminate() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.closed = true
+	b.terminateDisabled.Store(true)
 }
 
 // Close encerra o WebSocket.
@@ -88,7 +89,7 @@ func (b *wsBridge) Close() {
 	b.closed = true
 	b.mu.Unlock()
 	b.cancel()
-	if !alreadyClosed {
+	if !alreadyClosed && b.conn != nil {
 		_ = b.conn.Close(websocket.StatusNormalClosure, "bridge closed")
 	}
 }
@@ -142,7 +143,7 @@ func (b *wsBridge) readLoop(browserOpus media.Codec) {
 	b.closed = true
 	b.mu.Unlock()
 
-	if fireCallback && b.OnTerminalWS != nil {
+	if fireCallback && !b.terminateDisabled.Load() && b.OnTerminalWS != nil {
 		b.OnTerminalWS()
 	}
 }
@@ -207,7 +208,8 @@ func (s *server) handleWSBridge(w http.ResponseWriter, r *http.Request) {
 		sess.feedBrowserAudio(callID, ac, browserOpus, payload)
 	}
 	bridge.OnTerminalWS = func() {
-		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
+		epoch := bridge.mediaEpoch.Load()
+		go ac.cm.EndBrowserCall(context.Background(), core.EndCallReasonUserEnded, epoch)
 	}
 
 	// Registra o bridge WebSocket na chamada (fecha WebRTC anterior se existia)

@@ -268,6 +268,26 @@ func (b *Broker) reassignOwner(id string, owner *string) bool {
 	return true
 }
 
+// claimTransferred compares and assigns under one lock: simultaneous pickups
+// cannot steal ownership from the winner. Keep the existing status broadcasts.
+func (b *Broker) claimTransferred(id, owner string) bool {
+	b.mu.Lock()
+	c, ok := b.calls[id]
+	if !ok || (c.Owner != nil && *c.Owner != owner) {
+		b.mu.Unlock()
+		return false
+	}
+	c.Owner = &owner
+	rec := *c
+	b.mu.Unlock()
+	b.broadcastCallList()
+	b.broadcast(map[string]any{
+		"type": "call-status", "sessionId": rec.SessionID, "id": rec.CallID, "owner": rec.Owner,
+		"status": rec.Status, "peer": rec.Peer, "startedAt": rec.StartedAt, "held": rec.Held,
+	})
+	return true
+}
+
 func (b *Broker) ownerActiveCall(owner string) string {
 	if owner == "" {
 		return ""

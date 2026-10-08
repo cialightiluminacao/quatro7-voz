@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -35,6 +36,9 @@ func (s *server) routes() http.Handler {
 	// O browser envia/recebe PCM Int16 LE 16 kHz via WSS/443 em vez de WebRTC/UDP.
 	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/ws", s.handleWSBridge)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept", s.handleAccept)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/announce", s.handleAnnounce)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept-announce", s.handleAnnounce)
+	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hold-music", s.handleHoldMusic)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/reject", s.handleReject)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/video/{action}", s.handleCallVideo)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/hold", s.handleHold)
@@ -509,11 +513,27 @@ func (s *server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
-	// Melhor esforço: coloca em espera com música. Se já estiver em espera, tudo bem.
-	_ = ac.cm.Hold(true)
+	ac.bridgeOpMu.Lock()
+	defer ac.bridgeOpMu.Unlock()
+	if _, exists := s.broker.getCall(id); !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
+	if ac.cm.VideoState().State != core.CallStateOnHold {
+		if err := ac.cm.Hold(true); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	// Release A's transport as well as ownership; it cannot hear or feed B's call.
+	sess.swapBrowserMedia(id, ac, nil, nil, nil)
+	ac.transferTarget = strings.TrimSpace(body.To)
 
 	from := clientID(r)
-	s.broker.reassignOwner(id, nil) // libera o dono para o alvo poder assumir
+	if !s.broker.reassignOwner(id, nil) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+		return
+	}
 	peer := ""
 	if cr, ok := s.broker.getCall(id); ok && cr != nil {
 		peer = cr.Peer
@@ -532,13 +552,24 @@ func (s *server) handlePickup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok := sess.reg.get(id); !ok {
+	ac, ok := sess.reg.get(id)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
 	owner := clientID(r)
-	if !s.broker.reassignOwner(id, &owner) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
+	if owner == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "clientId required"})
+		return
+	}
+	ac.bridgeOpMu.Lock()
+	defer ac.bridgeOpMu.Unlock()
+	if ac.transferTarget != "" && ac.transferTarget != owner {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "transfer targets another client"})
+		return
+	}
+	if !s.broker.claimTransferred(id, owner) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "call unavailable or claimed by another client"})
 		return
 	}
 	s.broker.emitTransferClaimed(sess.id, id, owner)
@@ -653,21 +684,15 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		sess.feedBrowserAudio(callID, ac, browserOpus, payload)
 	}
 	bridge.OnBrowserVideo = func(au []byte) {
-		ac.cm.FeedCapturedVideo(au)
+		ac.cm.FeedBrowserVideo(bridge.mediaEpoch.Load(), au)
 	}
 	bridge.callID = callID
 	bridge.OnVideoEnvelope = func(negotiatedCallID string) {
-		// Nunca chamar cm (mu) sob mediaMu (callregistry.go): confere a ponte, solta e só então habilita.
-		ac.mediaMu.Lock()
-		current, _, ok := sess.reg.mediaOf(negotiatedCallID)
-		match := ok && current == bridge
-		ac.mediaMu.Unlock()
-		if match {
-			ac.cm.EnableVideoEnvelope(negotiatedCallID)
-		}
+		ac.cm.EnableVideoEnvelopeForBridge(negotiatedCallID, bridge.mediaEpoch.Load())
 	}
 	bridge.OnTerminalICE = func() {
-		go sess.terminateCall(callID, core.EndCallReasonUserEnded)
+		epoch := bridge.mediaEpoch.Load()
+		go ac.cm.EndBrowserCall(context.Background(), core.EndCallReasonUserEnded, epoch)
 	}
 	sess.setBridge(callID, bridge, browserOpus)
 	writeJSON(w, http.StatusOK, map[string]string{"sdp_answer": answer})
@@ -680,6 +705,8 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
+	ac.bridgeOpMu.Lock()
+	defer ac.bridgeOpMu.Unlock()
 	owner := clientID(r)
 	// Antes bloqueávamos o operador de aceitar uma 2ª chamada com uma já ativa. Agora
 	// permitimos "atender em espera": o painel coloca a atual em hold e aceita a nova.

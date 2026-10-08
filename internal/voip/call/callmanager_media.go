@@ -22,6 +22,13 @@ func (m *CallManager) initCodec() {
 func (m *CallManager) FeedCapturedPCM(data []float32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.playback != nil {
+		return
+	}
+	m.feedCapturedPCMLocked(data)
+}
+
+func (m *CallManager) feedCapturedPCMLocked(data []float32) {
 	if m.codec == nil || len(data) == 0 {
 		return
 	}
@@ -35,9 +42,9 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 	}
 }
 
-func (m *CallManager) sendOpusFrameLocked(opus []byte) {
+func (m *CallManager) sendOpusFrameLocked(opus []byte) bool {
 	if m.rtpSession == nil || m.srtpSession == nil {
-		return
+		return false
 	}
 	marker := !m.firstPacketSent
 	pkt := m.rtpSession.CreatePacketWithDuration(opus, m.codec.FrameSize(), marker)
@@ -52,10 +59,11 @@ func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 	if err != nil {
 		m.noteSendError()
 		m.log.Debug("srtp protect error", "err", err)
-		return
+		return false
 	}
 	m.noteSendLocked(time.Now())
 	m.relay.Broadcast(srtp)
+	return true
 }
 
 func (m *CallManager) startMediaSendLoopLocked() {
@@ -65,15 +73,15 @@ func (m *CallManager) startMediaSendLoopLocked() {
 	stop := make(chan struct{})
 	m.sendLoopStop = stop
 	frameSize := m.codec.FrameSize()
+	ticker := m.mediaClock().NewTicker(mediaFrameDuration)
 	go func() {
-		ticker := time.NewTicker(60 * time.Millisecond)
 		defer ticker.Stop()
 		silence := make([]float32, frameSize)
 		for {
 			select {
 			case <-stop:
 				return
-			case <-ticker.C:
+			case <-ticker.Ticks():
 			}
 			m.mu.Lock()
 			if m.sendLoopStop != stop {
@@ -94,6 +102,11 @@ func (m *CallManager) sendMediaFrameLocked(silence []float32) {
 	}
 	frame := silence
 	switch {
+	case m.playback != nil:
+		if m.currentCall == nil || (m.currentCall.StateData.State != core.CallStateActive && m.currentCall.StateData.State != core.CallStateOnHold) {
+			return
+		}
+		frame = m.playbackFrameLocked(frameSize)
 	case m.held:
 		// Em espera: não envia o mic do atendente. Toca música de espera
 		// (ou silêncio) para o interlocutor manter o leg vivo.
@@ -116,7 +129,12 @@ func (m *CallManager) sendMediaFrameLocked(silence []float32) {
 	m.sendStats.EncodeMax = max(m.sendStats.EncodeMax, encodeDuration)
 	m.sendStatsMu.Unlock()
 	if err == nil {
-		m.sendOpusFrameLocked(opus)
+		if m.sendOpusFrameLocked(opus) && m.playback != nil {
+			m.sendStatsMu.Lock()
+			m.sendStats.CaptureFrames++
+			m.sendStatsMu.Unlock()
+			m.playbackSentLocked(frameSize)
+		}
 	} else {
 		m.noteSendError()
 	}
@@ -153,7 +171,9 @@ func (m *CallManager) onRelayData(data []byte) {
 	case core.PayloadTypeWhatsAppOpus:
 		m.handleAudioRelayData(data)
 	case core.PayloadTypeWhatsAppH264:
+		m.peerVideoReceiveMu.Lock()
 		m.video.HandleRelayData(data)
+		m.peerVideoReceiveMu.Unlock()
 	}
 }
 
