@@ -12,6 +12,7 @@ import (
 )
 
 const (
+	rtpStepSamples = 90000 / 15 // contrato do encoder: 15 Hz, sem jitter da chegada
 	// Backpressure global antes de packetizar; o relay aplica idade por AU e
 	// um teto menor de vídeo no SCTP, inclusive durante uma AU grande.
 	congestionDropBytes = 256 << 10
@@ -226,6 +227,15 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		countReason(&p.diag.txDrops, "invalid-annexb")
 		return
 	}
+	// Uma AU codificada ocupa um slot de 15 Hz, inclusive se for descartada
+	// abaixo. Antes do primeiro IDR admitido, o relógio ainda não começou.
+	// Chegadas iguais/regredidas e atrasos de IDR não podem virar passos de 1 tick.
+	var timestampStep uint32
+	if !p.firstAUAt.IsZero() {
+		timestampStep = rtpStepSamples
+		rtp.AdvanceTimestamp(timestampStep)
+		p.clockTicks += uint64(timestampStep)
+	}
 	idr := hasIDR(nalus)
 	haveSPS, havePPS := false, false
 	for _, n := range nalus {
@@ -309,24 +319,8 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		requestKeyframe = p.requestKeyframeLocked(now)
 		return
 	}
-	var timestampStep uint32
 	if p.firstAUAt.IsZero() {
 		p.firstAUAt = at
-	} else {
-		// Usar a chegada da AU, antes dos locks, para não comprimir/alongar
-		// frames pela espera na packetização. Clock 90 kHz inclui pausas/drops.
-		elapsed := at.Sub(p.firstAUAt)
-		var ticks uint64
-		if elapsed > 0 {
-			ticks = uint64(elapsed/time.Second)*90000 + uint64(elapsed%time.Second*90000/time.Second)
-		}
-		// Duas AUs na mesma unidade de clock não podem ter o mesmo timestamp.
-		if ticks <= p.clockTicks {
-			ticks = p.clockTicks + 1
-		}
-		timestampStep = uint32(ticks - p.clockTicks)
-		rtp.AdvanceTimestamp(timestampStep)
-		p.clockTicks = ticks
 	}
 	mediaFrameInfo := uint8(videoMediaFrameDelta)
 	if idr {
@@ -387,7 +381,10 @@ func (p *Pipeline) FeedCapturedAt(au []byte, at time.Time) {
 		p.diag.srOctets += uint32(len(pkt.Payload))
 		p.diag.srTimestamp = pkt.Header.Timestamp
 	}
-	p.diag.srRtpAt = at
+	// SR e RTP compartilham a mesma linha do tempo nominal. Vincular o último
+	// timestamp à chegada real reintroduziria jitter/deriva no mapeamento RTP/NTP.
+	nominalElapsed := time.Duration(p.clockTicks/90000)*time.Second + time.Duration(p.clockTicks%90000)*time.Second/90000
+	p.diag.srRtpAt = p.firstAUAt.Add(nominalElapsed)
 	// Um monitor que começou só para recepção pode estar aguardando 5 s.
 	// Reagenda para começar os SR de envio em 1,5 s.
 	if firstRTP {

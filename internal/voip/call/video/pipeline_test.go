@@ -332,7 +332,7 @@ func TestRelayDropRequestsKeyframeWithRateLimit(t *testing.T) {
 	}
 }
 
-func TestCapturedTimestampsFollowElapsedTimeIncludingDrops(t *testing.T) {
+func TestCapturedTimestampsUseFixedCadenceIncludingDroppedSlots(t *testing.T) {
 	p, r, peer := testPipeline(t)
 	p.EnableEnvelope()
 	start := time.Unix(100, 0)
@@ -366,7 +366,7 @@ func TestCapturedTimestampsFollowElapsedTimeIncludingDrops(t *testing.T) {
 	if len(timestamps) != 5 {
 		t.Fatal(timestamps)
 	}
-	for i, want := range []uint32{0, 2999, 9000, 28530, 180000} {
+	for i, want := range []uint32{0, 6000, 12000, 18000, 36000} {
 		if got := timestamps[i] - timestamps[0]; got != want {
 			t.Fatalf("timestamp[%d]=%d quero=%d", i, got, want)
 		}

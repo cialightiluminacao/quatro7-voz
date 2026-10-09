@@ -202,9 +202,12 @@ func TestCapturedClockSurvivesRTPRollover(t *testing.T) {
 	p, r, peer := testPipeline(t)
 	now := time.Unix(100, 0)
 	manualVideoClock(p, &now)
+	// Posição determinística perto do wrap, sem esperar 13 horas nem usar a chegada como clock.
+	initial := p.rtp.CreatePacketWithDuration(nil, 0, false).Header.Timestamp
+	p.rtp.AdvanceTimestamp(^uint32(0) - 3000 - initial)
 	idr := annexBNALs([]byte{0x65, 1})
 	p.FeedCaptured(idr)
-	now = now.Add(50000 * time.Second) // mais de um ciclo uint32 a 90 kHz
+	now = now.Add(50000 * time.Second)
 	p.FeedCaptured(idr)
 	now = now.Add(100 * time.Millisecond)
 	p.FeedCaptured(idr)
@@ -216,9 +219,8 @@ func TestCapturedClockSurvivesRTPRollover(t *testing.T) {
 		}
 		timestamps = append(timestamps, pkt.Header.Timestamp)
 	}
-	const fullTicks uint64 = 50000 * 90000
-	if timestamps[1]-timestamps[0] != uint32(fullTicks&0xffffffff) || timestamps[2]-timestamps[1] != 9000 {
-		t.Fatal(timestamps)
+	if timestamps[0] != ^uint32(0)-3000 || timestamps[1] != 2999 || timestamps[2]-timestamps[1] != 6000 || p.clockTicks != 12000 {
+		t.Fatal(timestamps, p.clockTicks)
 	}
 }
 
@@ -244,7 +246,7 @@ func TestCapturedH264SamplesExposeBitstreamProfile(t *testing.T) {
 	}
 }
 
-func TestCapturedTimestampUsesArrivalAndAdvancesForBursts(t *testing.T) {
+func TestCapturedTimestampIgnoresArrivalJitterAndBursts(t *testing.T) {
 	p, r, peer := testPipeline(t)
 	start := time.Unix(100, 0)
 	now := start
@@ -269,7 +271,7 @@ func TestCapturedTimestampUsesArrivalAndAdvancesForBursts(t *testing.T) {
 	if len(timestamps) != 5 {
 		t.Fatal(timestamps)
 	}
-	for i, step := range []uint32{0, 4500, 4501, 4502, 10800} {
+	for i, step := range []uint32{0, 6000, 12000, 18000, 24000} {
 		if got := timestamps[i] - timestamps[0]; got != step {
 			t.Fatalf("AU %d timestamp step=%d want=%d", i, got, step)
 		}
@@ -327,5 +329,73 @@ func TestH264PayloadSamplesBoundedPerCall(t *testing.T) {
 	rows = infoRecords(t, &buf, "video receive H264 payload sample")
 	if len(rows) != 23 || rows[22]["call_id"] != "CID2" {
 		t.Fatal("nova chamada não recarregou amostras")
+	}
+}
+
+// Reproduz atrasos de IDR e rajadas do DataChannel: a packetização não altera o período.
+func TestCapturedFixedCadenceAcrossFragmentedAUs(t *testing.T) {
+	p, r, peer := testPipeline(t)
+	start := time.Unix(100, 0)
+	now := start
+	manualVideoClock(p, &now)
+	idr := annexBNALs([]byte{0x67, 0x42, 0xc0, 22}, []byte{0x68, 1}, append([]byte{0x65}, bytes.Repeat([]byte{7}, 4200)...))
+	delta := annexBNALs(append([]byte{0x41}, bytes.Repeat([]byte{8}, 1400)...))
+	var firstTS uint32
+	var previousSeq uint16
+	for frame, ms := range []int{0, 49, 117, 183, 251, 382, 382, 381, 1700} {
+		now = start.Add(time.Duration(ms) * time.Millisecond)
+		au := delta
+		if frame == 0 || frame == 5 || frame == 8 {
+			au = idr
+		}
+		before := len(r.packets)
+		p.FeedCapturedAt(au, now)
+		wires := r.packets[before:]
+		if len(wires) < 2 {
+			t.Fatalf("AU %d não foi fragmentada: %d", frame, len(wires))
+		}
+		var depack transport.H264Depacketizer
+		var rebuilt []byte
+		for fragment, wire := range wires {
+			pkt, err := peer.Unprotect(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if frame == 0 && fragment == 0 {
+				firstTS = pkt.Header.Timestamp
+			} else if pkt.Header.SequenceNumber != previousSeq+1 {
+				t.Fatal("sequência RTP não avançou")
+			}
+			previousSeq = pkt.Header.SequenceNumber
+			if pkt.Header.Timestamp-firstTS != uint32(frame)*6000 || pkt.Header.Marker != (fragment == len(wires)-1) {
+				t.Fatalf("AU %d fragmento %d: timestamp=%d marker=%v", frame, fragment, pkt.Header.Timestamp-firstTS, pkt.Header.Marker)
+			}
+			for _, nalu := range depack.Depacketize(pkt.Payload) {
+				rebuilt = append(rebuilt, annexBStartCode...)
+				rebuilt = append(rebuilt, nalu...)
+			}
+		}
+		if !bytes.Equal(rebuilt, au) {
+			t.Fatalf("AU %d mudou na fragmentação", frame)
+		}
+	}
+}
+
+func TestCapturedNominalClockBeyondTwoRTPWraps(t *testing.T) {
+	p, _, _ := testPipeline(t)
+	start := time.Unix(100, 0)
+	now := start
+	manualVideoClock(p, &now)
+	idr := annexBNALs([]byte{0x65, 1})
+	p.FeedCapturedAt(idr, now)
+	// Simula o contador de uma chamada >27 horas sem gerar 1,5 milhão de AUs.
+	const ticks uint64 = 100000 * 90000
+	p.clockTicks = ticks
+	p.rtp.AdvanceTimestamp(uint32(ticks & 0xffffffff))
+	now = start.Add(100000 * time.Second)
+	p.FeedCapturedAt(idr, now)
+	wantAt := start.Add(100000*time.Second + time.Second/15)
+	if p.clockTicks != ticks+6000 || !p.diag.srRtpAt.Equal(wantAt) {
+		t.Fatalf("clock nominal/SR após dois wraps: ticks=%d at=%v want=%v", p.clockTicks, p.diag.srRtpAt, wantAt)
 	}
 }

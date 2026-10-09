@@ -321,3 +321,53 @@ func TestAuthenticatedREMBEffectsOnlyAfterWholeCompoundValidation(t *testing.T) 
 		t.Fatal("subtração de áudio causou underflow")
 	}
 }
+
+func TestVideoSenderReportsUseNominalClockAcrossJitterAndDrops(t *testing.T) {
+	p, r, peerRTP := testPipeline(t)
+	start := time.Unix(100, 0)
+	now := start
+	manualVideoClock(p, &now)
+	idr := annexBNALs([]byte{0x65, 1})
+	delta := annexBNALs([]byte{0x41, 2})
+	p.FeedCapturedAt(idr, now)
+	first, err := peerRTP.Unprotect(r.packets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ms := range []int{49, 117, 183} {
+		now = start.Add(time.Duration(ms) * time.Millisecond)
+		p.FeedCapturedAt(delta, now)
+	}
+	// Dois slots codificados descartados não comprimem o tempo do IDR seguinte.
+	now = start.Add(251 * time.Millisecond)
+	r.setBuffered(congestionDropBytes + 1)
+	p.FeedCapturedAt(delta, now)
+	r.setBuffered(0)
+	now = start.Add(317 * time.Millisecond)
+	p.FeedCapturedAt(delta, now)
+	now = start.Add(382 * time.Millisecond)
+	p.FeedCapturedAt(idr, now)
+	if p.diag.txSubmitted != 5 || p.clockTicks != 36000 {
+		t.Fatal(p.diag.txSubmitted, p.clockTicks)
+	}
+	keys := core.SrtpKeyingMaterial{MasterKey: make([]byte, 16), MasterSalt: make([]byte, 14)}
+	peerRTCP, err := media.NewSrtcpSession(keys, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 2; i++ {
+		now = start.Add(time.Duration(i) * videoReportInterval)
+		p.monitorVideo(p.monitorEpoch)
+		plain, err := peerRTCP.Unprotect(r.packets[len(r.packets)-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := first.Header.Timestamp + uint32(i)*135000
+		if got := binary.BigEndian.Uint32(plain[16:20]); got != want {
+			t.Fatalf("SR incorporou jitter de chegada: got=%d want=%d", got, want)
+		}
+		if binary.BigEndian.Uint32(plain[20:24]) != 5 || binary.BigEndian.Uint32(plain[24:28]) != 10 {
+			t.Fatalf("contadores SR incluem AUs descartadas: %x", plain)
+		}
+	}
+}

@@ -209,8 +209,8 @@ func (p *Pipeline) sendVideoReportLocked(now time.Time, packets, octets uint32) 
 	if !p.relay.HasConnection() {
 		return
 	}
-	// Timestamp do último RTP admitido + avanço do clock 90 kHz até o NTP
-	// deste relatório. Não assume fps fixo do browser.
+	// Timestamp do último RTP admitido + avanço de 90 kHz desde o instante
+	// nominal desse quadro. A chegada do DataChannel não altera o clock do SR.
 	elapsed := now.Sub(d.srRtpAt)
 	timestamp := d.srTimestamp + uint32(elapsed/time.Second)*90000 + uint32(elapsed%time.Second*90000/time.Second)
 	packet, err := p.srtcp.Protect(media.BuildVideoSenderReport(p.selfSsrc, timestamp, packets, octets, now.UnixMilli()))
