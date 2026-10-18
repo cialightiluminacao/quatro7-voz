@@ -85,31 +85,13 @@ func BuildOfferStanza(ctx context.Context, sock core.VoipSocket, callID string, 
 	}, rawDevices, nil
 }
 
-func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid, callCreator types.JID, isVideo bool) (waBinary.Node, error) {
-	if err := sock.AssertSessions(ctx, []types.JID{callCreator}, true); err != nil {
-		return waBinary.Node{}, fmt.Errorf("assert creator session: %w", err)
-	}
-
-	nodes, includeDeviceIdentity, err := sock.CreateParticipantNodes(ctx, []types.JID{callCreator}, callKey, waBinary.Attrs{"count": "0"})
-	if err != nil {
-		return waBinary.Node{}, fmt.Errorf("encrypt accept: %w", err)
-	}
-
-	encNode := extractEncFromParticipant(nodes)
-	if encNode == nil {
-		return waBinary.Node{}, fmt.Errorf("no enc node produced for accept")
-	}
-
+// Accept selects the relay medium, using the key already delivered by offer.
+// SIG-03: audio -> net(medium=2) -> encopt; do not inject offer-style key nodes.
+func BuildAcceptStanza(_ context.Context, _ core.VoipSocket, callID string, _ []byte, peerJid, callCreator types.JID, isVideo bool) (waBinary.Node, error) {
 	acceptContent := []waBinary.Node{
 		{Tag: "audio", Attrs: waBinary.Attrs{"enc": "opus", "rate": "16000"}},
-		{Tag: "net", Attrs: waBinary.Attrs{"medium": "3"}},
-		*encNode,
+		{Tag: "net", Attrs: waBinary.Attrs{"medium": "2"}},
 		{Tag: "encopt", Attrs: waBinary.Attrs{"keygen": "2"}},
-	}
-	if includeDeviceIdentity {
-		if di, ok := sock.AccountDeviceIdentityNode(); ok {
-			acceptContent = append(acceptContent, di)
-		}
 	}
 	if isVideo {
 		acceptContent = append(acceptContent, waBinary.Node{Tag: "video", Attrs: waBinary.Attrs{"enc": "h264"}})
@@ -117,29 +99,13 @@ func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string,
 
 	return waBinary.Node{
 		Tag:   "call",
-		Attrs: waBinary.Attrs{"to": wanode.MustJID(wanode.CleanJID(peerJid.String())), "id": GenerateCallStanzaID()},
+		Attrs: waBinary.Attrs{"to": peerJid, "id": GenerateCallStanzaID()},
 		Content: []waBinary.Node{{
 			Tag:     "accept",
 			Attrs:   waBinary.Attrs{"call-id": callID, "call-creator": callCreator},
 			Content: acceptContent,
 		}},
 	}, nil
-}
-
-func extractEncFromParticipant(nodes []waBinary.Node) *waBinary.Node {
-	for _, n := range nodes {
-		n := n
-		if n.Tag == "enc" {
-			return &n
-		}
-		for _, c := range wanode.NodeChildren(&n) {
-			c := c
-			if c.Tag == "enc" {
-				return &c
-			}
-		}
-	}
-	return nil
 }
 
 func BuildTerminateStanza(peerJid types.JID, callID string, callCreator types.JID) waBinary.Node {
